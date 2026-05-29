@@ -2,6 +2,7 @@
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Playwright;
 using Renci.SshNet;
 using System.Globalization;
 using System.Text.RegularExpressions;
@@ -16,6 +17,9 @@ internal static class Program
 
         try
         {
+            // -- In TESTING
+            RunPortalAutomation().GetAwaiter().GetResult();
+
             // ── Load configuration ────────────────────────────────────────
             var config = new ConfigurationBuilder()
                 .SetBasePath(AppContext.BaseDirectory)
@@ -345,5 +349,163 @@ internal static class Program
             c = c / 26 - 1;
         }
         return col + rowNum;
+    }
+
+    private static async Task RunPortalAutomation()
+    {
+        Console.WriteLine("Launching browser...");
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(
+            new BrowserTypeLaunchOptions
+            {
+                Headless = false // set true for background automation
+            });
+
+        // IgnoreHTTPSErrors must be on the context, not the page
+        var context = await browser.NewContextAsync(new BrowserNewContextOptions
+        {
+            IgnoreHTTPSErrors = true,
+            AcceptDownloads = true
+        });
+        var page = await context.NewPageAsync();
+
+        await page.GotoAsync(
+            "https://10.45.57.100/index.phtml",
+            new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        Console.WriteLine("Page loaded.");
+
+        // ── LOGIN ─────────────────────────────
+        //await page.WaitForSelectorAsync("#username");
+        // Clear and type username
+        // First page
+        await page.WaitForSelectorAsync("#username");
+
+        await page.ClickAsync("#username");
+        await page.FillAsync("#username", "");
+        await page.Keyboard.TypeAsync("cbccalebod", new KeyboardTypeOptions { Delay = 50 });
+
+        await page.ClickAsync("#random");
+        await page.FillAsync("#random", "");
+        await page.Keyboard.TypeAsync("Al3xander64!", new KeyboardTypeOptions { Delay = 50 });
+
+        // Submit and catch the popup
+        var popupTask = context.WaitForPageAsync();
+        await page.ClickAsync("input[type='submit']");
+        var popup = await popupTask;
+
+        // Second page (popup) — same credentials
+        await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await popup.WaitForSelectorAsync("#username");
+
+        await popup.ClickAsync("#username");
+        await popup.FillAsync("#username", "");
+        await popup.Keyboard.TypeAsync("cbccalebod", new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.ClickAsync("#random");
+        await popup.FillAsync("#random", "");
+        await popup.Keyboard.TypeAsync("Al3xander64!", new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.PressAsync("#random", "Enter");
+        
+        Console.WriteLine("Logged in.");
+
+        // Wait for the post-login UI (the left nav with "Reports" in your screenshot)
+        await popup.WaitForSelectorAsync("#REPORTS");
+        await popup.ClickAsync("#REPORTS");
+        await popup.WaitForTimeoutAsync(3000);
+
+        // Get the frame directly by name
+        var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
+
+        await mainFrame.WaitForSelectorAsync("select[name='report_seq']");
+        await mainFrame.SelectOptionAsync("select[name='report_seq']", new SelectOptionValue { Value = "16" });
+        Console.WriteLine("Report selected.");
+
+        //await mainFrame.PressAsync("select[name='report_seq']", "Enter");
+
+        // Generate Report opens a new window — capture it
+        var reportPageTask = context.WaitForPageAsync();
+        await mainFrame.ClickAsync("text=Generate Report");
+
+        var reportPage = await reportPageTask;
+
+        await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await reportPage.WaitForTimeoutAsync(3000);
+
+        // Find which frame has the date inputs
+        IFrame dateFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>("input#start_date", "els => els.length");
+                if (found > 0)
+                {
+                    dateFrame = f;
+                    Console.WriteLine($"Found date inputs in frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        // Set date range: first of current month to today
+        var today = DateTime.Today;
+        var firstOfMonth = new DateTime(today.Year, today.Month, 1).ToString("yyyy-MM-dd");
+        var todayStr = today.ToString("yyyy-MM-dd");
+
+        await dateFrame.EvalOnSelectorAsync("#start_date",
+            $"el => {{ el.value = '{firstOfMonth}'; el.dispatchEvent(new Event('change')); }}");
+
+        await dateFrame.EvalOnSelectorAsync("#end_date",
+            $"el => {{ el.value = '{todayStr}'; el.dispatchEvent(new Event('change')); }}");
+
+        Console.WriteLine($"Date range set: {firstOfMonth} to {todayStr}");
+
+        // Click Render Report (inspect to confirm the selector)
+        await dateFrame.ClickAsync("text=Render Report");
+        Console.WriteLine("Render Report clicked.");
+
+        // Reports can take a while to render. Wait for either a known element on
+        // the rendered report OR the export/download button to appear.
+        // Wait 10 seconds for the report to render
+        await reportPage.WaitForTimeoutAsync(10000);
+        Console.WriteLine("Wait complete. Searching for export/download options...");
+
+        // Find the frame with the export button
+        IFrame exportFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>("#_export_button", "els => els.length");
+                if (found > 0)
+                {
+                    exportFrame = f;
+                    Console.WriteLine($"Found export button in frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        // Click export and capture the download
+        var download = await reportPage.RunAndWaitForDownloadAsync(async () =>
+        {
+            await exportFrame.ClickAsync("#_export_button");
+        });
+
+        var savePath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\CIBC POST.csv";
+
+        // Delete existing file if present
+        if (File.Exists(savePath))
+            File.Delete(savePath);
+
+        await download.SaveAsAsync(savePath);
+        Console.WriteLine($"Downloaded: {savePath}");
+
+        Console.WriteLine("Automation completed.");
+        await Task.Delay(5000);
+        await browser.CloseAsync();
     }
 }
