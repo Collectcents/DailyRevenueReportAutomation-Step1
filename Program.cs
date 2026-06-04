@@ -11,21 +11,32 @@ namespace DailyRevenueReportAutomation;
 
 internal static class Program
 {
+    // ── Load configuration ────────────────────────────────────────
+    static IConfiguration config = new ConfigurationBuilder()
+    .SetBasePath(AppContext.BaseDirectory)
+    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
+    .AddEnvironmentVariables()
+    .Build();
+
+    static string TDurl = config["TDPortal:Url"];
+    static string TDuser = config["TDPortal:Username"];
+    static string TDpass = config["TDPortal:Password"];
+    static string CIBCurl = config["CIBCPortal:Url"];
+    static string CIBCuser = config["CIBCPortal:Username"];
+    static string CIBCpass = config["CIBCPortal:Password"];
     private static int Main(string[] args)
     {
         string? localCsv = null;
 
         try
         {
-            // -- In TESTING
-            RunPortalAutomation().GetAwaiter().GetResult();
+            RunPerformanceReportAutomation().GetAwaiter().GetResult();
 
-            // ── Load configuration ────────────────────────────────────────
-            var config = new ConfigurationBuilder()
-                .SetBasePath(AppContext.BaseDirectory)
-                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
-                .AddEnvironmentVariables()
-                .Build();
+            // -- In TESTING
+            //TD Portal automation to download the report CSV directly
+            RunTDPortalAutomation().GetAwaiter().GetResult();
+            //CIBC Portal automation to download the report CSV directly
+            RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
             // ── SFTP settings ─────────────────────────────────────────────
             var sftpHost = config["Sftp:Host"]
@@ -351,7 +362,7 @@ internal static class Program
         return col + rowNum;
     }
 
-    private static async Task RunPortalAutomation()
+    private static async Task RunCIBCPortalAutomation()
     {
         Console.WriteLine("Launching browser...");
         using var playwright = await Playwright.CreateAsync();
@@ -370,7 +381,7 @@ internal static class Program
         var page = await context.NewPageAsync();
 
         await page.GotoAsync(
-            "https://10.45.57.100/index.phtml",
+            CIBCurl,
             new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
         Console.WriteLine("Page loaded.");
 
@@ -382,11 +393,11 @@ internal static class Program
 
         await page.ClickAsync("#username");
         await page.FillAsync("#username", "");
-        await page.Keyboard.TypeAsync("cbccalebod", new KeyboardTypeOptions { Delay = 50 });
+        await page.Keyboard.TypeAsync("", new KeyboardTypeOptions { Delay = 50 });
 
         await page.ClickAsync("#random");
         await page.FillAsync("#random", "");
-        await page.Keyboard.TypeAsync("Al3xander64!", new KeyboardTypeOptions { Delay = 50 });
+        await page.Keyboard.TypeAsync("!", new KeyboardTypeOptions { Delay = 50 });
 
         // Submit and catch the popup
         var popupTask = context.WaitForPageAsync();
@@ -399,14 +410,14 @@ internal static class Program
 
         await popup.ClickAsync("#username");
         await popup.FillAsync("#username", "");
-        await popup.Keyboard.TypeAsync("cbccalebod", new KeyboardTypeOptions { Delay = 50 });
+        await popup.Keyboard.TypeAsync(CIBCuser, new KeyboardTypeOptions { Delay = 50 });
 
         await popup.ClickAsync("#random");
         await popup.FillAsync("#random", "");
-        await popup.Keyboard.TypeAsync("Al3xander64!", new KeyboardTypeOptions { Delay = 50 });
+        await popup.Keyboard.TypeAsync(CIBCpass, new KeyboardTypeOptions { Delay = 50 });
 
         await popup.PressAsync("#random", "Enter");
-        
+
         Console.WriteLine("Logged in.");
 
         // Wait for the post-login UI (the left nav with "Reports" in your screenshot)
@@ -504,7 +515,422 @@ internal static class Program
         await download.SaveAsAsync(savePath);
         Console.WriteLine($"Downloaded: {savePath}");
 
+        Console.WriteLine("CIBC Automation completed.");
+        await Task.Delay(5000);
+        await browser.CloseAsync();
+    }
+
+    private static async Task RunTDPortalAutomation()
+    {
+        Console.WriteLine("Launching browser...");
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(
+            new BrowserTypeLaunchOptions
+            {
+                Headless = false,
+                Channel = "chrome",
+                Args = new[] { "--disable-blink-features=AutomationControlled" }
+            });
+
+        var context = await browser.NewContextAsync(new BrowserNewContextOptions
+        {
+            IgnoreHTTPSErrors = true,
+            AcceptDownloads = true
+        });
+        var page = await context.NewPageAsync();
+
+        await page.AddInitScriptAsync(@"
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    ");
+
+        await page.GotoAsync(
+            TDurl,
+            new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        await page.WaitForSelectorAsync("#username");
+        await page.WaitForTimeoutAsync(3000);
+        Console.WriteLine("Page loaded.");
+
+        // ── FIRST PAGE LOGIN ──────────────────
+        await page.ClickAsync("#username");
+        await page.FillAsync("#username", "");
+        await page.Keyboard.TypeAsync(
+            TDuser,
+            new KeyboardTypeOptions { Delay = 50 });
+
+        await page.ClickAsync("#random");
+        await page.FillAsync("#random", "");
+        await page.Keyboard.TypeAsync(
+            TDpass,
+            new KeyboardTypeOptions { Delay = 50 });
+
+        Console.WriteLine($"Username: {TDuser}");
+        Console.WriteLine($"Password: {TDpass}");
+        Console.WriteLine($"Password length: {TDpass.Length}");
+        Console.WriteLine($"Password bytes: {string.Join(" ", System.Text.Encoding.UTF8.GetBytes(TDpass).Select(b => $"{b:X2}"))}");
+        // Submit and try to catch popup
+        IPage popup = null;
+        try
+        {
+            var popupTask = context.WaitForPageAsync(new BrowserContextWaitForPageOptions
+            {
+                Timeout = 10000
+            });
+            await page.ClickAsync("input[type='submit']");
+            popup = await popupTask;
+            Console.WriteLine("Popup opened.");
+        }
+        catch
+        {
+            // No popup — login might have happened on the same page
+            Console.WriteLine("No popup. Checking current page...");
+            popup = page;
+        }
+
+        // ── SECOND PAGE LOGIN (if popup opened) ──
+        await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await popup.WaitForTimeoutAsync(2000);
+
+        var hasLoginForm = await popup.EvalOnSelectorAllAsync<int>("#username", "els => els.length");
+        if (hasLoginForm > 0 && popup != page)
+        {
+            Console.WriteLine("Second login form found. Filling...");
+            await popup.ClickAsync("#username");
+            await popup.FillAsync("#username", "");
+            await popup.Keyboard.TypeAsync(
+                Environment.GetEnvironmentVariable("PORTAL2_USER") ?? "REPLACE_ME",
+                new KeyboardTypeOptions { Delay = 50 });
+
+            await popup.ClickAsync("#random");
+            await popup.FillAsync("#random", "");
+            await popup.Keyboard.TypeAsync(
+                Environment.GetEnvironmentVariable("PORTAL2_PASS") ?? "REPLACE_ME",
+                new KeyboardTypeOptions { Delay = 50 });
+
+            await popup.PressAsync("#random", "Enter");
+            await popup.WaitForTimeoutAsync(3000);
+        }
+
+        // ── CHECK LOGIN ───────────────────────
+        var hasError = await popup.EvalOnSelectorAllAsync<int>("div.alert", "els => els.length");
+        if (hasError > 0)
+        {
+            var errorText = await popup.EvalOnSelectorAsync<string>("div.alert", "el => el.innerText");
+            Console.WriteLine($"Login FAILED: {errorText}");
+            Console.ReadLine();
+            return;
+        }
+        Console.WriteLine("Logged in.");
+
+        // ── CLICK REPORTS ─────────────────────
+        await popup.WaitForSelectorAsync("#REPORTS");
+        await popup.ClickAsync("#REPORTS");
+        await popup.WaitForTimeoutAsync(3000);
+
+        // ── SELECT REPORT ─────────────────────
+        var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
+        await mainFrame.WaitForSelectorAsync("select[name='report_seq']");
+        await mainFrame.SelectOptionAsync("select[name='report_seq']",
+            new SelectOptionValue { Value = "16" });
+        Console.WriteLine("Report selected.");
+
+        // ── GENERATE REPORT (new window) ──────
+        var reportPageTask = context.WaitForPageAsync();
+        await mainFrame.ClickAsync("text=Generate Report");
+        var reportPage = await reportPageTask;
+
+        await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await reportPage.WaitForTimeoutAsync(3000);
+
+        // ── SET DATE RANGE ────────────────────
+        IFrame dateFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>("input#start_date", "els => els.length");
+                if (found > 0)
+                {
+                    dateFrame = f;
+                    Console.WriteLine($"Found date inputs in frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        var today = DateTime.Today;
+        var firstOfMonth = new DateTime(today.Year, today.Month, 1).ToString("yyyy-MM-dd");
+        var todayStr = today.ToString("yyyy-MM-dd");
+
+        await dateFrame.EvalOnSelectorAsync("#start_date",
+            $"el => {{ el.value = '{firstOfMonth}'; el.dispatchEvent(new Event('change')); }}");
+        await dateFrame.EvalOnSelectorAsync("#end_date",
+            $"el => {{ el.value = '{todayStr}'; el.dispatchEvent(new Event('change')); }}");
+        Console.WriteLine($"Date range set: {firstOfMonth} to {todayStr}");
+
+        // ── RENDER REPORT ─────────────────────
+        await dateFrame.ClickAsync("text=Render Report");
+        Console.WriteLine("Render Report clicked.");
+
+        await reportPage.WaitForTimeoutAsync(30000);
+        Console.WriteLine("Wait complete.");
+
+        // ── EXPORT ────────────────────────────
+        IFrame exportFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>("#_export_button", "els => els.length");
+                if (found > 0)
+                {
+                    exportFrame = f;
+                    Console.WriteLine($"Found export button in frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        var download = await reportPage.RunAndWaitForDownloadAsync(async () =>
+        {
+            await exportFrame.ClickAsync("#_export_button");
+        });
+
+        // TODO: Update save path for this portal's report
+        var savePath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\PORTAL2 REPORT.csv";
+
+        if (File.Exists(savePath))
+            File.Delete(savePath);
+
+        await download.SaveAsAsync(savePath);
+        Console.WriteLine($"Downloaded: {savePath}");
+
         Console.WriteLine("Automation completed.");
+        await Task.Delay(5000);
+        await browser.CloseAsync();
+    }
+
+    private static async Task RunPerformanceReportAutomation()
+    {
+        Console.WriteLine("Launching Performance Report automation...");
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(
+            new BrowserTypeLaunchOptions
+            {
+                Headless = false
+            });
+
+        var context = await browser.NewContextAsync(new BrowserNewContextOptions
+        {
+            IgnoreHTTPSErrors = true,
+            AcceptDownloads = true
+        });
+        var page = await context.NewPageAsync();
+
+        await page.GotoAsync(
+            CIBCurl,
+            new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        await page.WaitForSelectorAsync("#username");
+        Console.WriteLine("Page loaded.");
+
+        // ── FIRST PAGE LOGIN ──────────────────
+        await page.ClickAsync("#username");
+        await page.FillAsync("#username", "");
+        await page.Keyboard.TypeAsync(CIBCuser, new KeyboardTypeOptions { Delay = 50 });
+
+        await page.ClickAsync("#random");
+        await page.FillAsync("#random", "");
+        await page.Keyboard.TypeAsync(CIBCpass, new KeyboardTypeOptions { Delay = 50 });
+
+        var popupTask = context.WaitForPageAsync();
+        await page.ClickAsync("input[type='submit']");
+        var popup = await popupTask;
+
+        // ── SECOND PAGE LOGIN ─────────────────
+        await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await popup.WaitForSelectorAsync("#username");
+
+        await popup.ClickAsync("#username");
+        await popup.FillAsync("#username", "");
+        await popup.Keyboard.TypeAsync(CIBCuser, new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.ClickAsync("#random");
+        await popup.FillAsync("#random", "");
+        await popup.Keyboard.TypeAsync(CIBCpass, new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.PressAsync("#random", "Enter");
+        Console.WriteLine("Logged in.");
+
+        // ── CLICK REPORTS ─────────────────────
+        await popup.WaitForSelectorAsync("#REPORTS");
+        await popup.ClickAsync("#REPORTS");
+        await popup.WaitForTimeoutAsync(3000);
+
+        // ── SELECT PERFORMANCE REPORT (seq 38) ─
+        var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
+        await mainFrame.WaitForSelectorAsync("select[name='report_seq']");
+        await mainFrame.SelectOptionAsync("select[name='report_seq']",
+            new SelectOptionValue { Value = "38" });
+        Console.WriteLine("Performance Report selected.");
+
+        // ── GENERATE REPORT (new window) ──────
+        var reportPageTask = context.WaitForPageAsync();
+        await mainFrame.ClickAsync("text=Generate Report");
+        var reportPage = await reportPageTask;
+
+        await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await reportPage.WaitForTimeoutAsync(3000);
+
+        // ── FIND THE CRITERIA FRAME ───────────
+        IFrame criteriaFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>(
+                    "input#start_date, input[name='start_date']",
+                    "els => els.length");
+                if (found > 0)
+                {
+                    criteriaFrame = f;
+                    Console.WriteLine($"Found criteria in frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        // ── CALCULATE DATES ───────────────────
+        // Start: last year, current month + 1, current day
+        // End: today
+        var today = DateTime.Today;
+        var startDate = new DateTime(today.Year, today.Month, 1)
+                    .AddYears(-1)
+                    .AddMonths(1);
+        var startStr = startDate.ToString("yyyy-MM-dd");
+        var endStr = today.ToString("yyyy-MM-dd");
+
+        Console.WriteLine($"Date range: {startStr} to {endStr}");
+
+        // ── SET ASSIGNED DATE RANGE ───────────
+        // Debug: find all date inputs to get exact selectors
+        var dateInputs = await criteriaFrame.EvalOnSelectorAllAsync<string>(
+            "input[type='text']",
+            "els => els.map(e => `id=${e.id} name=${e.name} value=${e.value}`).join('\\n')");
+        Console.WriteLine($"Date inputs found:\n{dateInputs}");
+
+        // Set Assigned Date Range (first pair of date inputs)
+        await criteriaFrame.EvalOnSelectorAsync("#start_date",
+            $"el => {{ el.value = '{startStr}'; el.dispatchEvent(new Event('change')); }}");
+        await criteriaFrame.EvalOnSelectorAsync("#end_date",
+            $"el => {{ el.value = '{endStr}'; el.dispatchEvent(new Event('change')); }}");
+
+        // Set Payment Date Range (second pair — adjust selectors based on debug output above)
+        // These IDs are guesses — check the debug output for actual IDs
+        await criteriaFrame.EvalOnSelectorAsync("#start_pdate",
+            $"el => {{ el.value = '{startStr}'; el.dispatchEvent(new Event('change')); }}");
+        await criteriaFrame.EvalOnSelectorAsync("#end_pdate",
+            $"el => {{ el.value = '{endStr}'; el.dispatchEvent(new Event('change')); }}");
+
+        Console.WriteLine("Dates set.");
+
+        // ── HELPER: Run report for a specific agency ──
+        async Task ExportForAgency(string agencyValue, string filename)
+        {
+            // Select agency in phase_to_view dropdown
+            // First deselect all, then select the target agency
+            await criteriaFrame.EvalOnSelectorAsync("#phase_to_view",
+                $@"el => {{
+                for (var i = 0; i < el.options.length; i++) {{
+                    el.options[i].selected = (el.options[i].value === '{agencyValue}');
+                }}
+                el.dispatchEvent(new Event('change'));
+            }}");
+            Console.WriteLine($"Selected {agencyValue}.");
+
+            // Click Render Report
+            await criteriaFrame.ClickAsync("text=Render Report");
+            Console.WriteLine("Render Report clicked. Waiting 2.5 minutes...");
+
+            await reportPage.WaitForTimeoutAsync(150000);
+
+            // Find export button
+            IFrame exportFrame = null;
+            foreach (var f in reportPage.Frames)
+            {
+                try
+                {
+                    var found = await f.EvalOnSelectorAllAsync<int>(
+                        "#_export_button", "els => els.length");
+                    if (found > 0)
+                    {
+                        exportFrame = f;
+                        break;
+                    }
+                }
+                catch { }
+            }
+
+            // Export
+            var download = await reportPage.RunAndWaitForDownloadAsync(async () =>
+            {
+                await exportFrame.ClickAsync("#_export_button");
+            });
+
+            var savePath = $@"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\VTs\{filename}";
+
+            if (File.Exists(savePath))
+                File.Delete(savePath);
+
+            await download.SaveAsAsync(savePath);
+            Console.WriteLine($"Downloaded: {savePath}");
+        }
+
+        // ── EXPORT AGENCY2 ───────────────────
+        await ExportForAgency("AGENCY2", "2.csv");
+
+        // ── GO BACK TO CRITERIA ──────────────
+        IFrame editFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>(
+                    "text=Edit Criteria", "els => els.length");
+                if (found > 0)
+                {
+                    editFrame = f;
+                    break;
+                }
+            }
+            catch { }
+        }
+        await editFrame.ClickAsync("text=Edit Criteria");
+        await reportPage.WaitForTimeoutAsync(3000);
+
+        // Re-find the criteria frame (it may have reloaded)
+        criteriaFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>(
+                    "#phase_to_view", "els => els.length");
+                if (found > 0)
+                {
+                    criteriaFrame = f;
+                    Console.WriteLine($"Re-found criteria frame: name='{f.Name}'");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        // ── EXPORT AGENCY4 ───────────────────
+        await ExportForAgency("AGENCY4", "4.csv");
+
+        Console.WriteLine("Performance Report automation completed.");
         await Task.Delay(5000);
         await browser.CloseAsync();
     }
