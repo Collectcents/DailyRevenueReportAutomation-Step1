@@ -1,8 +1,9 @@
 ﻿using ClosedXML.Excel;
-using DocumentFormat.OpenXml.Bibliography;
+using DocumentFormat.OpenXml;
+using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
-using DocumentFormat.OpenXml.Wordprocessing;
+using DocumentFormat.OpenXml.Spreadsheet;
 using ExcelDataReader;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Playwright;
@@ -37,7 +38,7 @@ internal static class Program
             //await TestTDPortalHttp();
 
             //Saving all daily ACE transaction to Rev Report
-            GetDailyRevenueACETransactions(args);
+            //GetDailyRevenueACETransactions(args);
 
             //TD Portal automation to download the report CSV directly
             //RunTDPortalAutomation().GetAwaiter().GetResult();
@@ -46,8 +47,7 @@ internal static class Program
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
             //RunCibcDrsCalculator();
-            //
-            //ApplyManualAdjustments();
+            ApplyManualAdjustments();
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -64,190 +64,372 @@ internal static class Program
 
     private static void ApplyManualAdjustments()
     {
-        var revReportPath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+        var revReportDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+        var adjustmentsRoot = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\Manual Adjustments";
+        var revManualTab = "Manual Adjustments";
+        var agentTabs = new[] { "Tim Katis", "Barb Boudreau", "Ian Tougas", "Frank Ramlal", "HOUSE" };
 
-        // Find current month's rev report (e.g. "Rev Report JUNE 2026 V8.xlsx")
-        var currentMonth = DateTime.Now.ToString("MMMM").ToUpper();
-        var currentYear = DateTime.Now.Year;
-        var revReportFile = Directory.GetFiles(revReportPath, $"Rev Report {currentMonth} {currentYear}*.xlsx")
-            .OrderByDescending(f => File.GetLastWriteTime(f))
-            .FirstOrDefault()
-            ?? throw new FileNotFoundException($"Rev Report for {currentMonth} {currentYear} not found.");
-        Console.WriteLine("═══════════════════════════════════════════");
-        Console.WriteLine("  Manual Adjustments");
-        Console.WriteLine($"  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        Console.WriteLine("═══════════════════════════════════════════");
+        const int DeskCol = 4, DayStartCol = 9, DayEndCol = 41;
 
-        var adjustmentsDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others";
-        var adjFile = Directory.GetFiles(adjustmentsDir, "Manual Adjustments*.xlsx")
-            .OrderByDescending(f => File.GetLastWriteTime(f))
-            .FirstOrDefault()
-            ?? throw new FileNotFoundException("Manual Adjustments file not found.");
+        var now = DateTime.Now;
+        var log = new List<string>();
+        void Log(string m) { Console.WriteLine(m); log.Add($"{DateTime.Now:HH:mm:ss}  {m}"); }
 
-        Console.WriteLine($"  Adjustments: {Path.GetFileName(adjFile)}");
-        Console.WriteLine($"  Rev Report:  {Path.GetFileName(revReportPath)}");
-
-        // ── Read Manual Adjustments ──────────────────────────
-        Console.WriteLine("\nReading adjustments...");
-        using var adjWb = new XLWorkbook(adjFile);
-        var adjWs = adjWb.Worksheet(1);
-
-        var adjustments = new List<ManualAdjustment>();
-        var adjRow = 3; // data starts at row 3 (row 1 = title, row 2 = headers)
-
-        while (true)
+        // Parse a tab name to a date: handles "Aug 17", "August 17", "Jul 30", "July 30".
+        DateTime? ParseTabDate(string name)
         {
-            var dateCell = adjWs.Cell(adjRow, 1); // Column A = Date
-            if (dateCell.IsEmpty() || string.IsNullOrWhiteSpace(dateCell.GetString()))
-                break;
-
-            DateTime adjDate;
-            if (dateCell.TryGetValue(out DateTime dt))
-            {
-                adjDate = dt;
-            }
-            else
-            {
-                var dateStr = dateCell.GetString().Trim();
-                if (!DateTime.TryParse(dateStr, CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out adjDate))
-                {
-                    Console.WriteLine($"  WARNING: Row {adjRow} has unparseable date '{dateStr}'. Skipping.");
-                    adjRow++;
-                    continue;
-                }
-            }
-
-            var collector = adjWs.Cell(adjRow, 2).GetString().Trim();   // Column B = Collector
-            var from = adjWs.Cell(adjRow, 4).GetString().Trim();        // Column D = FROM
-            var toAgent = adjWs.Cell(adjRow, 6).GetString().Trim();     // Column F = TO AGENT
-
-            double comm = 0;
-            var commCell = adjWs.Cell(adjRow, 7);                       // Column G = COMM
-            if (commCell.TryGetValue(out double commVal))
-            {
-                comm = commVal;
-            }
-            else
-            {
-                var commStr = commCell.GetString().Replace("$", "").Replace(",", "").Trim();
-                double.TryParse(commStr, NumberStyles.Any, CultureInfo.InvariantCulture, out comm);
-            }
-
-            var tab = adjWs.Cell(adjRow, 8).GetString().Trim();         // Column H = TAB
-
-            adjustments.Add(new ManualAdjustment
-            {
-                Date = adjDate,
-                Collector = collector,
-                From = from,
-                ToAgent = toAgent,
-                Comm = comm,
-                Tab = tab
-            });
-
-            adjRow++;
+            name = (name ?? "").Trim();
+            foreach (var f in new[] { "MMM d", "MMMM d", "MMM dd", "MMMM dd" })
+                if (DateTime.TryParseExact($"{name} {now.Year}", $"{f} yyyy",
+                        CultureInfo.InvariantCulture, DateTimeStyles.None, out var d))
+                    return d.Date;
+            return null;
         }
-        Console.WriteLine($"  Found {adjustments.Count} adjustments.\n");
 
-        // ── Open Rev Report ──────────────────────────────────
-        using var revWb = new XLWorkbook(revReportPath);
+        Log("═══════════════════════════════════════════");
+        Log("  Manual Adjustments");
+        Log($"  {now:yyyy-MM-dd HH:mm:ss}");
+        Log("═══════════════════════════════════════════");
 
-        var applied = 0;
-        var skipped = 0;
+        // 1. Rev report file
+        var currentMonthUpper = now.ToString("MMMM").ToUpper();
+        var revReportFile = Directory.GetFiles(revReportDir, $"Rev Report {currentMonthUpper} {now.Year}*.xlsx")
+            .OrderByDescending(File.GetLastWriteTime).FirstOrDefault()
+            ?? throw new FileNotFoundException($"Rev Report for {currentMonthUpper} {now.Year} not found.");
 
-        foreach (var adj in adjustments)
+        // 2. Adjustments file
+        var monthDir = Path.Combine(adjustmentsRoot, now.ToString("MMMM"));
+        if (!Directory.Exists(monthDir))
+            throw new DirectoryNotFoundException($"Month folder not found: {monthDir}");
+        var adjFile = Directory.GetFiles(monthDir, "Manual Adjustments*.xlsx")
+            .OrderByDescending(File.GetLastWriteTime).FirstOrDefault()
+            ?? throw new FileNotFoundException($"Manual Adjustments file not found in {monthDir}.");
+
+        void FlushLog()
         {
-            // Find the tab
-            var ws = revWb.Worksheets.FirstOrDefault(s =>
-                s.Name.Equals(adj.Tab, StringComparison.OrdinalIgnoreCase));
-
-            if (ws == null)
+            try
             {
-                Console.WriteLine($"  SKIP: Tab '{adj.Tab}' not found. ({adj.Collector} -> {adj.ToAgent}, ${adj.Comm})");
-                skipped++;
-                continue;
+                var logDir = Path.Combine(monthDir, "Logs");
+                Directory.CreateDirectory(logDir);
+                var p = Path.Combine(logDir, $"ManualAdjustments_{now:yyyyMMdd_HHmmss}.txt");
+                File.WriteAllLines(p, log);
+                Console.WriteLine($"Log written: {p}");
             }
+            catch (Exception ex) { Console.WriteLine($"Log write failed: {ex.Message}"); }
+        }
 
-            // Find the date column (row 1, columns I onwards = I is col 9)
-            int dateCol = -1;
-            var targetDay = adj.Date.Day;
+        Log($"  Adjustments: {adjFile}");
+        Log($"  Rev Report:  {revReportFile}");
 
-            for (int c = 9; c <= 39; c++) // I=9 through AM=39
+        // 3. Read TODAY's tab from the adjustments file
+        Log("\nReading adjustments...");
+        var adjustments = new List<ManualAdjustment>();
+        var adjTemp = SanitizeWorkbookCopy(adjFile);   // repair blank/whitespace sheet names so ClosedXML can load
+        try
+        {
+            using var adjWb = new XLWorkbook(adjTemp);
+
+            var adjWs = adjWb.Worksheets.FirstOrDefault(s => ParseTabDate(s.Name) == now.Date);
+            if (adjWs == null)
             {
-                try
+                Log($"  No tab dated {now:MMM d} in the adjustments file — nothing to process today.");
+                FlushLog();
+                return;
+            }
+            Log($"  Reading tab: '{adjWs.Name}'");
+
+            var row = 3; // 1=title, 2=headers
+            while (true)
+            {
+                var dateCell = adjWs.Cell(row, 1);
+                if (dateCell.IsEmpty() || string.IsNullOrWhiteSpace(dateCell.GetString())) break;
+
+                DateTime adjDate;
+                if (!dateCell.TryGetValue(out adjDate) && !TryParseAdjDate(dateCell.GetString(), out adjDate))
                 {
-                    var headerVal = ws.Cell(1, c).GetDouble();
-                    if ((int)headerVal == targetDay)
+                    Log($"  WARNING: row {row} unparseable date '{dateCell.GetString()}' — skipped.");
+                    row++; continue;
+                }
+
+                double comm = 0;
+                var commCell = adjWs.Cell(row, 6);
+                if (!commCell.TryGetValue(out comm))
+                    double.TryParse(commCell.GetString().Replace("$", "").Replace(",", "").Trim(),
+                        NumberStyles.Any, CultureInfo.InvariantCulture, out comm);
+
+                adjustments.Add(new ManualAdjustment
+                {
+                    Date = adjDate,
+                    Collector = adjWs.Cell(row, 2).GetString().Trim(),
+                    Debt = adjWs.Cell(row, 3).GetString().Trim(),
+                    From = adjWs.Cell(row, 4).GetString().Trim(),
+                    ToAgent = adjWs.Cell(row, 5).GetString().Trim(),
+                    Comm = comm,
+                    Tab = adjWs.Cell(row, 7).GetString().Trim()
+                });
+                row++;
+            }
+        }
+        finally { try { File.Delete(adjTemp); } catch { } }
+
+        Log($"  Found {adjustments.Count} adjustments.");
+        if (adjustments.Count == 0) { Log("  Nothing to post."); FlushLog(); return; }
+
+        // 4. Write into the Rev Report
+        try
+        {
+            using (var doc = SpreadsheetDocument.Open(revReportFile, isEditable: true))
+            {
+                var (manPart, manData) = GetSheet(doc, revManualTab);
+
+                uint last = manData.Elements<Row>()
+                        .Where(r => r.Elements<Cell>().Any(c =>
+                            !string.IsNullOrEmpty(c.CellValue?.Text) ||
+                            c.InlineString != null))
+                        .Select(r => r.RowIndex?.Value ?? 0u)
+                        .DefaultIfEmpty(1u)
+                        .Max();
+                uint writeRow = last + 1;
+
+                // double-post guard: bail if today already appears in column B
+                foreach (var r in manData.Elements<Row>())
+                {
+                    var bCell = r.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) == 2);
+                    if (GetNumber(bCell) is double oa && oa >= -657435 && oa <= 2958465
+    && DateTime.FromOADate(oa).Date == now.Date)
                     {
-                        dateCol = c;
-                        break;
+                        var cVals = string.Join(" | ", r.Elements<Cell>()
+                            .OrderBy(c => ColIndex(c.CellReference))
+                            .Select(c => $"{c.CellReference}={c.CellValue?.Text}"));
+                        Log($"  ABORT: row {r.RowIndex?.Value} already today. Contents: {cVals}");
+                        FlushLog(); return;
                     }
                 }
-                catch { }
-            }
 
-            if (dateCol == -1)
-            {
-                Console.WriteLine($"  SKIP: Day {targetDay} not found in '{adj.Tab}' row 1. ({adj.Collector} -> {adj.ToAgent})");
-                skipped++;
-                continue;
-            }
+                foreach (var a in adjustments)
+                {
+                    Log($"    row: date={a.Date:MM/dd/yyyy} collector={a.Collector} debt={a.Debt} comm={a.Comm} from={a.From} to={a.ToAgent}");
+                    var above = manData.Elements<Row>()
+                    .FirstOrDefault(r => r.RowIndex != null && r.RowIndex.Value == writeRow - 1);
+                    uint? bS = above?.Elements<Cell>()
+                        .FirstOrDefault(c => ColIndex(c.CellReference) == 2)?.StyleIndex?.Value;
+                    uint? cS = above?.Elements<Cell>()
+                        .FirstOrDefault(c => ColIndex(c.CellReference) == 3)?.StyleIndex?.Value;
 
-            // Find Collector in column B and DEDUCT
-            var collectorDeducted = false;
-            if (!string.IsNullOrEmpty(adj.Collector))
-            {
-                var collectorRow = FindAgentRow(ws, adj.Collector);
-                if (collectorRow > 0)
-                {
-                    var cell = ws.Cell(collectorRow, dateCol);
-                    double currentVal = 0;
-                    cell.TryGetValue(out currentVal);
-                    cell.Value = currentVal - adj.Comm;
-                    collectorDeducted = true;
+                    var row = GetOrCreateRow(manData, writeRow);
+                    SetDate(GetOrCreateCell(row, 2), now.Date, bS);
+                    SetDate(GetOrCreateCell(row, 3), a.Date, cS);
+                    SetText(GetOrCreateCell(row, 4), a.Debt);
+                    SetText(GetOrCreateCell(row, 5), a.From);
+                    SetText(GetOrCreateCell(row, 6), a.ToAgent);
+                    SetNumber(GetOrCreateCell(row, 7), a.Comm);
+                    writeRow++;
                 }
-                else
-                {
-                    Console.WriteLine($"  WARNING: Collector '{adj.Collector}' not found in '{adj.Tab}'.");
-                }
-            }
+                manPart.Worksheet.Save();
 
-            // Find TO AGENT in column B and ADD
-            var agentAdded = false;
-            if (!string.IsNullOrEmpty(adj.ToAgent))
-            {
-                var toRow = FindAgentRow(ws, adj.ToAgent);
-                if (toRow > 0)
-                {
-                    var cell = ws.Cell(toRow, dateCol);
-                    double currentVal = 0;
-                    cell.TryGetValue(out currentVal);
-                    cell.Value = currentVal + adj.Comm;
-                    agentAdded = true;
-                }
-                else
-                {
-                    Console.WriteLine($"  WARNING: TO AGENT '{adj.ToAgent}' not found in '{adj.Tab}'.");
-                }
-            }
+                // TODO: agent-tab apply goes here — see note below
 
-            if (collectorDeducted || agentAdded)
-            {
-                Console.WriteLine($"  Applied: {adj.Tab} | Day {targetDay} | -{adj.Comm:F2} from {adj.Collector} | +{adj.Comm:F2} to {adj.ToAgent}");
-                applied++;
-            }
-            else
-            {
-                skipped++;
+                // make Excel recalc formulas and refresh pivots when the file opens
+                var wb = doc.WorkbookPart.Workbook;
+                wb.CalculationProperties ??= wb.AppendChild(new CalculationProperties());
+                wb.CalculationProperties.FullCalculationOnLoad = true;
+                foreach (var pc in doc.WorkbookPart.GetPartsOfType<PivotTableCacheDefinitionPart>())
+                { pc.PivotCacheDefinition.RefreshOnLoad = true; pc.PivotCacheDefinition.Save(); }
+                wb.Save();
             }
         }
+        catch (Exception ex)
+        {
+            Log($"SECTION 4 FAILED: {ex.GetType().Name}: {ex.Message}");
+            Log(ex.ToString());
+            FlushLog();
+            throw;
+        }
 
-        // ── Save ─────────────────────────────────────────────
-        Console.WriteLine($"\nApplied: {applied}, Skipped: {skipped}");
-        revWb.Save();
-        Console.WriteLine($"Saved: {Path.GetFileName(revReportPath)}");
-        Console.WriteLine("═══════════════════════════════════════════");
+        FlushLog();
+        Log("Done.");
+    }
+
+    // ---- helpers ----
+    static int ColIndex(string cellRef)
+    {
+        if (string.IsNullOrEmpty(cellRef)) return 0;
+        int i = 0, col = 0;
+        while (i < cellRef.Length && char.IsLetter(cellRef[i]))
+        { col = col * 26 + (char.ToUpper(cellRef[i]) - 'A' + 1); i++; }
+        return col;
+    }
+    static string ColName(int index)
+    {
+        string s = ""; while (index > 0) { index--; s = (char)('A' + index % 26) + s; index /= 26; }
+        return s;
+    }
+    static (WorksheetPart part, SheetData data) GetSheet(SpreadsheetDocument doc, string name)
+    {
+        var sheet = doc.WorkbookPart.Workbook.Descendants<Sheet>()
+            .FirstOrDefault(s => string.Equals(s.Name, name, StringComparison.OrdinalIgnoreCase))
+            ?? throw new InvalidOperationException($"Sheet '{name}' not found.");
+        var part = (WorksheetPart)doc.WorkbookPart.GetPartById(sheet.Id);
+        return (part, part.Worksheet.GetFirstChild<SheetData>());
+    }
+    static Row GetOrCreateRow(SheetData data, uint rowIndex)
+    {
+        var row = data.Elements<Row>().FirstOrDefault(r => r.RowIndex != null && r.RowIndex.Value == rowIndex);
+        if (row != null) return row;
+        row = new Row { RowIndex = rowIndex };
+        var after = data.Elements<Row>().FirstOrDefault(r => r.RowIndex != null && r.RowIndex.Value > rowIndex);
+        if (after != null) data.InsertBefore(row, after); else data.Append(row);
+        return row;
+    }
+    static Cell GetOrCreateCell(Row row, int col)
+    {
+        string reff = ColName(col) + row.RowIndex;
+        var cell = row.Elements<Cell>().FirstOrDefault(c => c.CellReference == reff);
+        if (cell != null) return cell;
+        var after = row.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) > col);
+        cell = new Cell { CellReference = reff };
+        if (after != null) row.InsertBefore(cell, after); else row.Append(cell);
+        return cell;
+    }
+    static void SetText(Cell c, string text)
+    {
+        c.RemoveAllChildren();                 // drop any old <f>, <v>, <is>, cached type
+        c.CellFormula = null;
+        c.DataType = CellValues.InlineString;
+        c.Append(new InlineString(new Text(text ?? "") { Space = SpaceProcessingModeValues.Preserve }));
+    }
+    static void SetNumber(Cell c, double v)
+    {
+        c.RemoveAllChildren<CellFormula>(); c.RemoveAllChildren<InlineString>();
+        c.DataType = null;               // number is default; this also drops a formula's "str" type
+        c.CellValue = new CellValue(v.ToString(CultureInfo.InvariantCulture));
+    }
+    static double? GetNumber(Cell c)     // reads a value OR a formula's cached value
+        => double.TryParse(c?.CellValue?.Text, NumberStyles.Any, CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
+    static void SetDate(Cell c, DateTime d, uint? styleFromAbove)
+    {
+        c.RemoveAllChildren<CellFormula>(); c.RemoveAllChildren<InlineString>();
+        c.DataType = null;
+        if (styleFromAbove.HasValue) c.StyleIndex = styleFromAbove.Value;
+        c.CellValue = new CellValue(d.ToOADate().ToString(CultureInfo.InvariantCulture));
+    }
+
+    // Copies the workbook to a temp file and renames any blank/whitespace sheet
+    // name so ClosedXML can load it. Caller deletes the temp file. Renames rather
+    // than deletes — deleting a referenced sheet part can throw or corrupt the copy.
+    private static string SanitizeWorkbookCopy(string sourcePath)
+    {
+        var tempPath = Path.Combine(Path.GetTempPath(),
+            $"adj_{DateTime.Now:yyyyMMddHHmmss}_{Guid.NewGuid():N}.xlsx");
+        File.Copy(sourcePath, tempPath, overwrite: true);
+
+        using (var doc = SpreadsheetDocument.Open(tempPath, isEditable: true))
+        {
+            var sheets = doc.WorkbookPart?.Workbook?.Sheets?.Elements<Sheet>().ToList();
+            var changed = false;
+            foreach (var sheet in sheets ?? Enumerable.Empty<Sheet>())
+            {
+                if (string.IsNullOrWhiteSpace(sheet.Name))
+                {
+                    sheet.Name = "RECOVERED_" + (sheet.SheetId?.Value.ToString()
+                                                 ?? Guid.NewGuid().ToString("N"));
+                    changed = true;
+                }
+            }
+            if (changed) doc.WorkbookPart.Workbook.Save();
+        }
+        return tempPath;
+    }
+
+    private static void ApplySide(
+        XLWorkbook wb, string[] tabs, string name, int day, double delta,
+        int deskCol, int dayStart, int dayEnd,
+        string sideLabel, string tag, Action<string> logLine,
+        ref int applied, ref int skipped)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            logLine($"  SKIP {sideLabel} {tag}: name is blank."); skipped++; return;
+        }
+
+        var (ws, row, count) = FindDeskAcrossTabs(wb, tabs, name, deskCol);
+        if (ws == null)
+        {
+            logLine($"  SKIP {sideLabel} {tag}: '{name}' not matched in any tab (column D)."); skipped++; return;
+        }
+        if (count > 1)
+            logLine($"  WARN {sideLabel} {tag}: '{name}' matched {count} rows — using {ws.Name} row {row}.");
+
+        int col = FindDayColumn(ws, day, dayStart, dayEnd);
+        if (col == -1)
+        {
+            logLine($"  SKIP {sideLabel} {tag}: day {day} not found in '{ws.Name}' row-1 headers."); skipped++; return;
+        }
+
+        var cell = ws.Cell(row, col);
+        if (cell.HasFormula)
+            logLine($"  WARN {sideLabel} {tag}: {ws.Name}!{cell.Address} is a FORMULA — being replaced with a value.");
+
+        double cur = 0; cell.TryGetValue(out cur);
+        double updated = cur + delta;
+        cell.Value = updated;
+
+        logLine($"  OK   {sideLabel} {tag}: {ws.Name} row {row} ({name}) {cell.Address}  {cur:F2} -> {updated:F2}  ({(delta < 0 ? "" : "+")}{delta:F2})");
+        applied++;
+    }
+
+    private static (IXLWorksheet ws, int row, int matchCount) FindDeskAcrossTabs(
+        XLWorkbook wb, string[] tabs, string search, int deskCol)
+    {
+        var target = NormalizeName(search);
+        if (target.Length == 0) return (null, -1, 0);
+
+        IXLWorksheet firstWs = null; int firstRow = -1, count = 0;
+        foreach (var tabName in tabs)
+        {
+            var ws = wb.Worksheets.FirstOrDefault(s => s.Name.Equals(tabName, StringComparison.OrdinalIgnoreCase));
+            if (ws == null) continue;
+
+            int last = ws.LastRowUsed()?.RowNumber() ?? 0;
+            for (int r = 2; r <= last; r++)
+            {
+                var d = ws.Cell(r, deskCol).GetString().Trim();
+                if (d.Length == 0) continue;
+
+                bool match = NormalizeName(d) == target;
+                if (!match && d.Contains('/'))                       // desk codes like "LD / TX / BA"
+                    match = d.Split('/').Any(t => NormalizeName(t) == target);
+
+                if (match)
+                {
+                    if (firstWs == null) { firstWs = ws; firstRow = r; }
+                    count++;
+                }
+            }
+        }
+        return (firstWs, firstRow, count);
+    }
+
+    private static int FindDayColumn(IXLWorksheet ws, int day, int start, int end)
+    {
+        for (int c = start; c <= end; c++)
+        {
+            var cell = ws.Cell(1, c);
+            if (cell.TryGetValue(out double d) && (int)d == day) return c;
+            if (int.TryParse(cell.GetString().Trim(), out int di) && di == day) return c;
+        }
+        return -1;
+    }
+
+    private static string NormalizeName(string s) =>
+        new string((s ?? "").Where(char.IsLetterOrDigit).ToArray()).ToUpperInvariant();
+
+    private static bool TryParseAdjDate(string s, out DateTime date)
+    {
+        s = (s ?? "").Trim();
+        string[] fmts = { "M.d.yyyy", "MM.dd.yyyy", "M/d/yyyy", "MM/dd/yyyy", "M/d/yy", "MM/dd/yy", "yyyy-MM-dd" };
+        return DateTime.TryParseExact(s, fmts, CultureInfo.InvariantCulture, DateTimeStyles.None, out date)
+            || DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out date);
     }
 
     private static void RemoveLegacyFormControls(string filePath)
@@ -318,6 +500,7 @@ internal static class Program
         public string From { get; set; } = "";
         public string ToAgent { get; set; } = "";
         public double Comm { get; set; }
+        public string Debt { get; set; } = "";
         public string Tab { get; set; } = "";
     }
 
@@ -411,7 +594,8 @@ internal static class Program
         // Find current month's rev report (e.g. "Rev Report JUNE 2026 V8.xlsx")
         var currentMonth = DateTime.Now.ToString("MMMM").ToUpper();
         var currentYear = DateTime.Now.Year;
-        var revReportFile = Directory.GetFiles(revReportPath, $"Rev Report {currentMonth} {currentYear}*.xlsx")
+        //var revReportFile = Directory.GetFiles(revReportPath, $"Rev Report {currentMonth} {currentYear}*.xlsx")
+        var revReportFile = Directory.GetFiles(revReportPath, $"TESTRevReport.xlsx")
             .OrderByDescending(f => File.GetLastWriteTime(f))
             .FirstOrDefault()
             ?? throw new FileNotFoundException($"Rev Report for {currentMonth} {currentYear} not found.");
