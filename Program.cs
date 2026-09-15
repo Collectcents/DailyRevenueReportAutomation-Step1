@@ -10,6 +10,7 @@ using Microsoft.Playwright;
 using Renci.SshNet;
 using System.Data;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using Table = DocumentFormat.OpenXml.Spreadsheet.Table;
 
@@ -42,12 +43,13 @@ internal static class Program
 
             //TD Portal automation to download the report CSV directly
             //RunTDPortalAutomation().GetAwaiter().GetResult();
+            CopyReportValuesToRevenueWorkbook();
 
             //CIBC Portal automation to download the report CSV directly
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
             //RunCibcDrsCalculator();
-            ApplyManualAdjustments();
+            //ApplyManualAdjustments();
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -59,6 +61,273 @@ internal static class Program
         {
             Console.Error.WriteLine($"ERROR: {ex.Message}");
             //return 1;
+        }
+    }
+
+    private static async Task RunTDPortalAutomation()
+    {
+        Console.WriteLine("Launching browser...");
+        using var playwright = await Playwright.CreateAsync();
+        await using var browser = await playwright.Chromium.LaunchAsync(
+            new BrowserTypeLaunchOptions { Headless = false });
+
+        var context = await browser.NewContextAsync(new BrowserNewContextOptions
+        {
+            IgnoreHTTPSErrors = true,
+            AcceptDownloads = true
+        });
+        var page = await context.NewPageAsync();
+
+        await page.GotoAsync(TDurl, new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
+        Console.WriteLine("Page loaded.");
+
+        // ── FIRST LOGIN ──
+        await page.WaitForSelectorAsync("#username");
+        await page.ClickAsync("#username");
+        await page.FillAsync("#username", "");
+        await page.Keyboard.TypeAsync(TDuser, new KeyboardTypeOptions { Delay = 50 });
+        await page.ClickAsync("#random");
+        await page.FillAsync("#random", "");
+        await page.Keyboard.TypeAsync(TDpass, new KeyboardTypeOptions { Delay = 50 });
+
+        // Capture the popup that opens on submit
+        var popupTask = context.WaitForPageAsync();
+        await page.ClickAsync("#ok");
+        var popup = await popupTask;
+
+        // ── SECOND LOGIN (in the popup) ──
+        await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+        await popup.WaitForSelectorAsync("#username");
+
+        await popup.ClickAsync("#username");
+        await popup.FillAsync("#username", "");
+        await popup.Keyboard.TypeAsync(TDuser, new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.ClickAsync("#random");
+        await popup.FillAsync("#random", "");
+        await popup.Keyboard.TypeAsync(TDpass, new KeyboardTypeOptions { Delay = 50 });
+
+        await popup.ClickAsync("#ok");
+        await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
+
+        // ── OPEN REPORTS ──
+        await popup.WaitForSelectorAsync("#REPORTS");
+        await popup.ClickAsync("#REPORTS");
+        await popup.WaitForTimeoutAsync(1000);
+
+        // Report UI loads into the TDVMDRS_MAIN frame
+        var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "TDVMDRS_MAIN");
+
+        // ── SELECT "Collection and Commission Report" (value 16) ──
+        await mainFrame.SelectOptionAsync("select[name='report_seq']",
+    new SelectOptionValue { Value = "16" });
+        Console.WriteLine("Report selected.");
+
+        var criteriaFrame = popup.Frame("report_criteria");
+        var bodyText = await criteriaFrame.EvaluateAsync<string>("() => document.body.innerText");
+        Console.WriteLine("=== report_criteria body text (post-reset) ===");
+        Console.WriteLine(bodyText);
+
+
+        await mainFrame.ClickAsync("text=Generate Report");
+        Console.WriteLine("Generate Report clicked.");
+
+        // Give report_check.phtml's POST and the resulting GET time to complete
+        await popup.WaitForTimeoutAsync(5000);
+
+        Console.WriteLine($"Total pages in context: {context.Pages.Count}");
+        foreach (var p in context.Pages)
+            Console.WriteLine($"  Page: {p.Url}");
+
+        IFrame reportFrame = null;
+        IPage reportPage = null;
+        foreach (var p in context.Pages)
+        {
+            var f = p.Frames.FirstOrDefault(fr => fr.Url.Contains("collection_and_commission.phtml"));
+            if (f != null) { reportFrame = f; reportPage = p; break; }
+        }
+
+        if (reportFrame != null)
+        {
+            // Confirm the widget is actually there before touching it
+            var hasDateFields = await reportFrame.EvalOnSelectorAllAsync<int>("input#y_start_date", "els => els.length");
+            Console.WriteLine($"Date fields found on report page: {hasDateFields}");
+
+            if (hasDateFields > 0)
+            {
+                var today = DateTime.Today;
+                async Task SetDateAsync(string prefix, DateTime date)
+                {
+                    await reportFrame.FillAsync($"#y_{prefix}", date.ToString("yyyy"));
+                    await reportFrame.FillAsync($"#m_{prefix}", date.ToString("MM"));
+                    await reportFrame.FillAsync($"#d_{prefix}", date.ToString("dd"));
+                    await reportFrame.Locator($"#d_{prefix}").PressAsync("Tab");
+                }
+                await SetDateAsync("start_date", new DateTime(today.Year, today.Month, 1));
+                await SetDateAsync("end_date", today);
+
+                var hiddenStart = await reportFrame.EvalOnSelectorAsync<string>("#start_date", "el => el.value");
+                var hiddenEnd = await reportFrame.EvalOnSelectorAsync<string>("#end_date", "el => el.value");
+                Console.WriteLine($"Hidden fields after fill: start_date='{hiddenStart}', end_date='{hiddenEnd}'");
+            }
+        }
+        else
+        {
+            Console.WriteLine("collection_and_commission.phtml not found in any page/frame after 5s wait.");
+            // Dump every frame in every page so we can see what's actually there
+            foreach (var p in context.Pages)
+            {
+                Console.WriteLine($"--- Frames in page {p.Url} ---");
+                foreach (var f in p.Frames)
+                    Console.WriteLine($"  '{f.Name}' | {f.Url}");
+            }
+        }
+
+        // ── CLICK RENDER REPORT (applies the date filter you just set) ──
+        await reportFrame.ClickAsync("#render_button");
+        Console.WriteLine("Render Report clicked.");
+
+        // This page loads pleaseWait.js/Progress.js — there's likely a busy
+        // indicator while it re-renders with the new date range. Wait for
+        // network activity to settle rather than a blind fixed delay.
+        await reportPage.WaitForLoadStateAsync(LoadState.NetworkIdle);
+        await reportPage.WaitForTimeoutAsync(1000); // small buffer on top
+
+        // ── FIND EXPORT — search reportPage's frames, not popup's ──
+        IFrame exportFrame = null;
+        foreach (var f in reportPage.Frames)
+        {
+            try
+            {
+                var found = await f.EvalOnSelectorAllAsync<int>("#export_link", "els => els.length");
+                if (found > 0) { exportFrame = f; Console.WriteLine($"Found export button in frame: '{f.Name}'"); break; }
+            }
+            catch { }
+        }
+        // If it's not inside a sub-frame at all, check reportFrame directly as a fallback
+        if (exportFrame == null)
+        {
+            var foundOnReportFrame = await reportFrame.EvalOnSelectorAllAsync<int>("#export_link", "els => els.length");
+            if (foundOnReportFrame > 0) exportFrame = reportFrame;
+        }
+        if (exportFrame == null) throw new Exception("Could not find a frame containing #export_link.");
+
+        var download = await reportPage.RunAndWaitForDownloadAsync(async () =>
+        {
+            await exportFrame.ClickAsync("#export_link");
+        });
+
+        var suggested = download.SuggestedFilename;
+        var ext = Path.GetExtension(suggested);
+        var destFileName = $"TD_{DateTime.Today:MM-dd-yyyy}{ext}";
+        var destFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var destPath = Path.Combine(destFolder, destFileName);
+        await download.SaveAsAsync(destPath);
+        Console.WriteLine($"Exported to: {destPath}");
+
+        CopyReportValuesToRevenueWorkbook();
+    }
+
+    private static void CopyReportValuesToRevenueWorkbook()
+    {
+        // ── 1. LOCATE AND VERIFY TODAY'S DOWNLOADED FILE ──
+        var sourceFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var sourceFileName = $"TD_{DateTime.Today:MM-dd-yyyy}.csv";
+        var sourcePath = Path.Combine(sourceFolder, sourceFileName);
+
+        if (!File.Exists(sourcePath))
+            throw new FileNotFoundException($"Today's downloaded file was not found: {sourcePath}");
+
+        var sourceLastWrite = File.GetLastWriteTime(sourcePath);
+        if (sourceLastWrite.Date != DateTime.Today)
+            throw new InvalidOperationException(
+                $"File {sourcePath} exists but was last modified {sourceLastWrite:yyyy-MM-dd}, not today. Aborting — refusing to copy stale data.");
+
+        Console.WriteLine($"Source file verified as today's: {sourcePath}");
+
+        // ── 2. READ VALUES A3:F<lastRow> FROM THE SOURCE ──
+        List<object[]> sourceRows = new List<object[]>();
+        using (var reader = new StreamReader(sourcePath))
+        using (var csv = new CsvHelper.CsvReader(reader, System.Globalization.CultureInfo.InvariantCulture))
+        {
+            int lineNum = 0;
+            while (csv.Read())
+            {
+                lineNum++;
+                if (lineNum < 2) continue; // skip rows 1-2
+
+                var row = new object[6];
+                // replace these with the ACTUAL column meanings — don't auto-detect
+                row[0] = csv.GetField(0);                     // A: text/ID → string
+                row[1] = csv.GetField(1);                     // B: text → string
+                row[2] = ParseDecimal(csv.GetField(2));        // C: amount → double
+                row[3] = ParseDecimal(csv.GetField(3));        // D: amount → double
+                row[4] = ParseDecimal(csv.GetField(4));         // E: date → DateTime?
+                row[5] = csv.GetField(5);                     // F: text → string
+                sourceRows.Add(row);
+            }
+        }
+
+        static object ParseDecimal(string raw) =>
+            double.TryParse(raw, System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (object)raw;
+
+        // ── 3. FIND THE DESTINATION WORKBOOK ──
+        var destFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+        var monthName = DateTime.Today.ToString("MMMM").ToUpper(); // e.g. "SEPTEMBER"
+        var yearStr = DateTime.Today.Year.ToString();
+
+        var candidates = Directory.GetFiles(destFolder, "*.xlsx")
+            .Where(f => Path.GetFileName(f).ToUpper().Contains(monthName))
+            .Where(f => Path.GetFileName(f).Contains(yearStr))
+            .Where(f => Path.GetFileName(f).Contains("V8")) // hardcoded per your spec — see note above
+            .OrderByDescending(f => File.GetLastWriteTime(f))
+            .ToList();
+
+        if (candidates.Count == 0)
+            throw new FileNotFoundException(
+                $"No destination workbook found in {destFolder} matching month '{monthName}', year '{yearStr}', and 'V8'.");
+
+        var destPath = candidates.First();
+        Console.WriteLine($"Destination workbook: {destPath}");
+        if (candidates.Count > 1)
+            Console.WriteLine($"  WARNING: {candidates.Count} files matched — picked the most recently modified. Others: {string.Join(", ", candidates.Skip(1).Select(Path.GetFileName))}");
+
+        // ── 4. PASTE VALUES INTO 'TD DATA' STARTING AT H2 ──
+        using (var destWb = new XLWorkbook(destPath, new LoadOptions { RecalculateAllFormulas = false }))
+        {
+            var destWs = destWb.Worksheet("TD DATA");
+            for (int i = 0; i < sourceRows.Count; i++)
+            {
+                var destRow = 2 + i;
+                for (int c = 0; c < 6; c++)
+                {
+                    var destCol = 8 + c;
+                    var raw = sourceRows[i][c];
+                    try
+                    {
+                        destWs.Cell(destRow, destCol).Value = ToXLCellValue(raw);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new InvalidOperationException(
+                            $"Failed at source row {i + 3} (dest row {destRow}), column {(char)('A' + c)} " +
+                            $"(dest col {destCol}). Value: '{raw}' (type: {raw?.GetType().Name ?? "null"}). {ex.Message}", ex);
+                    }
+                }
+            }
+
+            destWb.CalculateMode = XLCalculateMode.Manual; // don't recalc on save either
+
+            try
+            {
+                destWb.Save();
+                Console.WriteLine($"Saved {sourceRows.Count} rows into '{Path.GetFileName(destPath)}' → TD DATA!H2.");
+            }
+            catch (IOException ex)
+            {
+                throw new IOException($"Could not save '{destPath}' — it may be open elsewhere. Close it and re-run.", ex);
+            }
         }
     }
 
@@ -178,7 +447,8 @@ internal static class Program
         // 4. Write into the Rev Report
         try
         {
-            using (var doc = SpreadsheetDocument.Open(revReportFile, isEditable: true))
+            //using (var doc = SpreadsheetDocument.Open(revReportFile, isEditable: true))
+            using (var doc = SpreadsheetDocument.Open(revReportFile, true, new OpenSettings { AutoSave = false }))
             {
                 var (manPart, manData) = GetSheet(doc, revManualTab);
 
@@ -225,11 +495,72 @@ internal static class Program
                     SetNumber(GetOrCreateCell(row, 7), a.Comm);
                     writeRow++;
                 }
+                //manPart.Worksheet.Save();
+
+                // ── agent-tab apply ──
+                // Pre-scan every agent tab's Desk column (D) once: normalized name -> matches across all tabs
+                var deskIndex = new Dictionary<string, List<(string tab, WorksheetPart part, uint row)>>();
+                foreach (var tabName in agentTabs)
+                {
+                    var (aPart, aData) = GetSheet(doc, tabName);
+                    foreach (var r in aData.Elements<Row>())
+                    {
+                        if (r.RowIndex == null) continue;
+                        var dCell = r.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) == DeskCol);
+                        var key = Normalize(GetCellText(dCell, doc));
+                        if (key.Length == 0) continue;
+                        if (!deskIndex.TryGetValue(key, out var lst)) deskIndex[key] = lst = new();
+                        lst.Add((tabName, aPart, r.RowIndex.Value));
+                    }
+                }
+
+                var touched = new HashSet<WorksheetPart>();
+                int applied = 0, skipped = 0;
+                Log("\nApplying to agent tabs...");
+                foreach (var a in adjustments)
+                {
+                    int day = a.Date.Day;
+                    string rec = $"[{a.Date:MM/dd} debt {a.Debt} ${a.Comm:F2} from '{a.From}' to '{a.ToAgent}']";
+
+                    deskIndex.TryGetValue(Normalize(a.From), out var fromM);
+                    deskIndex.TryGetValue(Normalize(a.ToAgent), out var toM);
+
+                    string reason =
+                        (fromM == null || fromM.Count == 0) ? $"FROM '{a.From}' not found in any Desk (D) column"
+                      : (fromM.Count > 1) ? $"FROM '{a.From}' matches {fromM.Count} desks (ambiguous)"
+                      : (toM == null || toM.Count == 0) ? $"TO '{a.ToAgent}' not found in any Desk (D) column"
+                      : (toM.Count > 1) ? $"TO '{a.ToAgent}' matches {toM.Count} desks (ambiguous)"
+                      : null;
+
+                    if (reason == null)
+                    {
+                        var (fTab, fPart, fRow) = fromM[0];
+                        var (tTab, tPart, tRow) = toM[0];
+                        var fCol = FindDayColumn(fPart, doc, day, DayStartCol, DayEndCol);
+                        var tCol = FindDayColumn(tPart, doc, day, DayStartCol, DayEndCol);
+                        if (fCol == null) reason = $"day {day} column not found on '{fTab}'";
+                        else if (tCol == null) reason = $"day {day} column not found on '{tTab}'";
+                        else
+                        {
+                            var fCell = GetOrCreateCell(GetOrCreateRow(fPart.Worksheet.GetFirstChild<SheetData>(), fRow), (int)fCol.Value);
+                            var tCell = GetOrCreateCell(GetOrCreateRow(tPart.Worksheet.GetFirstChild<SheetData>(), tRow), (int)tCol.Value);
+                            double fOld = GetNumber(fCell) ?? 0, tOld = GetNumber(tCell) ?? 0;
+                            SetNumber(fCell, fOld - a.Comm);      // deduct from FROM desk
+                            SetNumber(tCell, tOld + a.Comm);      // credit TO desk
+                            touched.Add(fPart); touched.Add(tPart);
+                            applied++;
+                            Log($"  OK   {rec}: {fTab} {ColName((int)fCol.Value)}{fRow} {fOld:F2}->{fOld - a.Comm:F2}  |  {tTab} {ColName((int)tCol.Value)}{tRow} {tOld:F2}->{tOld + a.Comm:F2}");
+                        }
+                    }
+
+                    if (reason != null) { Log($"  SKIP {rec}: {reason}"); skipped++; }
+                }
+                Log($"\nApplied {applied}, Skipped {skipped}.");
+
+                // ── persist everything at once (nothing was saved before this point) ──
                 manPart.Worksheet.Save();
+                foreach (var p in touched) p.Worksheet.Save();
 
-                // TODO: agent-tab apply goes here — see note below
-
-                // make Excel recalc formulas and refresh pivots when the file opens
                 var wb = doc.WorkbookPart.Workbook;
                 wb.CalculationProperties ??= wb.AppendChild(new CalculationProperties());
                 wb.CalculationProperties.FullCalculationOnLoad = true;
@@ -251,6 +582,72 @@ internal static class Program
     }
 
     // ---- helpers ----
+    // ── HELPER: fill the y/m/d text boxes for a given date field prefix ──
+    // helper — note the name is ToXLCellValue, NOT XLCellValue
+    static XLCellValue ToXLCellValue(object o) => o switch
+    {
+        null => Blank.Value,
+        string s => s,
+        double d => d,
+        bool b => b,
+        DateTime dt when dt.Year is >= 1900 and <= 9999 => dt,
+        DateTime dt => dt.ToString("yyyy-MM-dd"), // out-of-range date → write as text, don't throw
+        _ => o.ToString()
+    };
+    static async Task SetDateFieldAsync(IFrame frame, string prefix, DateTime date)
+    {
+        // prefix is "start_date" or "end_date"
+        await frame.FillAsync($"#y_{prefix}", date.ToString("yyyy"));
+        await frame.FillAsync($"#m_{prefix}", date.ToString("MM"));
+        await frame.FillAsync($"#d_{prefix}", date.ToString("dd"));
+
+        // These widgets (InputDate) typically sync the hidden field on blur —
+        // force it by tabbing off the last field.
+        await frame.Locator($"#d_{prefix}").PressAsync("Tab");
+
+        // Belt-and-suspenders: also set the hidden input directly and fire
+        // input/change in case the widget doesn't listen for blur on the
+        // individual boxes. Harmless if the blur already did it.
+        await frame.EvaluateAsync(@"(id, val) => {
+        const el = document.getElementById(id);
+        if (el) {
+            el.value = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }", new object[] { prefix, date.ToString("yyyy-MM-dd") });
+    }
+    static string Normalize(string s)   // "Richard Carlsen" and "RICHARD.CARLSEN" both -> "RICHARDCARLSEN"
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new StringBuilder();
+        foreach (var ch in s)
+            if (!char.IsWhiteSpace(ch) && ch != '.' && ch != '\u00A0')
+                sb.Append(char.ToUpperInvariant(ch));
+        return sb.ToString();
+    }
+
+    static string GetCellText(Cell c, SpreadsheetDocument doc)   // resolves shared strings (column D is text)
+    {
+        if (c == null) return "";
+        if (c.DataType?.Value == CellValues.SharedString && c.CellValue != null && int.TryParse(c.CellValue.Text, out var i))
+            return doc.WorkbookPart.SharedStringTablePart?.SharedStringTable?.ElementAtOrDefault(i)?.InnerText ?? "";
+        if (c.DataType?.Value == CellValues.InlineString) return c.InlineString?.InnerText ?? "";
+        return c.CellValue?.Text ?? "";
+    }
+
+    static uint? FindDayColumn(WorksheetPart part, SpreadsheetDocument doc, int day, int startCol, int endCol)
+    {
+        var header = part.Worksheet.GetFirstChild<SheetData>()?
+            .Elements<Row>().FirstOrDefault(r => r.RowIndex != null && r.RowIndex.Value == 1);
+        if (header == null) return null;
+        for (int col = startCol; col <= endCol; col++)
+        {
+            var cell = header.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) == col);
+            if (int.TryParse(GetCellText(cell, doc), out var n) && n == day) return (uint)col;
+        }
+        return null;
+    }
     static int ColIndex(string cellRef)
     {
         if (string.IsNullOrEmpty(cellRef)) return 0;
@@ -1608,6 +2005,7 @@ internal static class Program
             IgnoreHTTPSErrors = true,
             AcceptDownloads = true
         });
+
         var page = await context.NewPageAsync();
 
         await page.GotoAsync(
@@ -1885,381 +2283,6 @@ internal static class Program
     //    }
 
     //    Console.WriteLine("\nDone.");
-    //}
-
-    private static async Task TestTDPortalHttp()
-    {
-        Console.WriteLine("Testing TD Portal HTTP...\n");
-
-        var handler = new HttpClientHandler
-        {
-            ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
-            AllowAutoRedirect = false,
-            CookieContainer = new System.Net.CookieContainer()
-        };
-
-        using var client = new HttpClient(handler);
-        var baseUrl = "https://10.21.178.100";
-        var userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
-        client.DefaultRequestHeaders.Add("User-Agent", userAgent);
-
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
-        try
-        {
-            // ── STEP 1: GET login page ──
-            Console.WriteLine("STEP 1: GET login page...");
-            var getResponse = await client.GetAsync(TDurl, cts.Token);
-            Console.WriteLine($"  Status: {(int)getResponse.StatusCode}");
-
-            var cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-            Console.WriteLine($"  Session: {cookies[0]?.Name} = {cookies[0]?.Value}");
-
-            var loginHtml = await getResponse.Content.ReadAsStringAsync();
-            Console.WriteLine($"  Status: {(int)getResponse.StatusCode}");
-
-            // Analyze the form
-            Console.WriteLine("\n  Analyzing login form...");
-
-
-            // Find <form tag
-            var formIdx = loginHtml.IndexOf("<form", StringComparison.OrdinalIgnoreCase);
-            if (formIdx >= 0)
-            {
-                var formEnd = loginHtml.IndexOf(">", formIdx);
-                Console.WriteLine($"  Form tag: {loginHtml[formIdx..(formEnd + 1)]}");
-            }
-
-            // Find ALL input fields (not just hidden)
-            var allInputs = System.Text.RegularExpressions.Regex.Matches(
-                loginHtml, @"<input[^>]*>",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-            Console.WriteLine($"  All inputs ({allInputs.Count}):");
-            foreach (System.Text.RegularExpressions.Match m in allInputs)
-                Console.WriteLine($"    {m.Value}");
-
-            // Find the submit button
-            var submitIdx = loginHtml.IndexOf("onsubmit", StringComparison.OrdinalIgnoreCase);
-            while (submitIdx >= 0)
-            {
-                var lineStart = Math.Max(0, submitIdx - 100);
-                var lineEnd = Math.Min(loginHtml.Length, submitIdx + 100);
-                var line = loginHtml[lineStart..lineEnd];
-                if (line.Contains("<input", StringComparison.OrdinalIgnoreCase)
-                    || line.Contains("<button", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"  Submit element: ...{line.Trim()}...");
-                    break;
-                }
-                submitIdx = loginHtml.IndexOf("submit", submitIdx + 1, StringComparison.OrdinalIgnoreCase);
-            }
-
-            // Check for any password hashing/transformation
-            foreach (var keyword in new[] { "md5", "sha", "hash", "encrypt", "encode", "btoa", "digest" })
-            {
-                var idx = loginHtml.IndexOf(keyword, StringComparison.OrdinalIgnoreCase);
-                if (idx >= 0)
-                {
-                    var s = Math.Max(0, idx - 100);
-                    var e = Math.Min(loginHtml.Length, idx + 200);
-                    Console.WriteLine($"\n  Found '{keyword}':");
-                    Console.WriteLine(loginHtml[s..e]);
-                }
-            }
-
-            // ── STEP 2: POST browser verification ──
-            // Mimic exactly: xhr.setRequestHeader('Content-type', 'application/x-www-form-urlencoded; charset=utf-8')
-            // requestString = "request_dtl=" + encodeURI(JSON.stringify(tssBrowserInfo)) + "&user_agent=" + encodeURI(JSON.stringify(userAgent))
-            Console.WriteLine("\nSTEP 2: POST browser_verification.php...");
-
-            var requestDtlJson = System.Text.Json.JsonSerializer.Serialize(new
-            {
-                name = "Chrome",
-                version = "147.0.0.0",
-                engine = "Blink",
-                user_agent = userAgent,
-                os = "Windows",
-                os_version = "10"
-            });
-
-            // encodeURI(JSON.stringify(value)) — Uri.EscapeUriString mimics encodeURI
-            var requestString = "request_dtl=" + Uri.EscapeDataString(requestDtlJson)
-                              + "&user_agent=" + Uri.EscapeDataString("\"" + userAgent + "\"");
-
-            Console.WriteLine($"  Sending: {requestString[..Math.Min(200, requestString.Length)]}...");
-
-            var verifyRequest = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/browser_verification.php")
-            {
-                Content = new StringContent(
-                    requestString,
-                    System.Text.Encoding.UTF8,
-                    "application/x-www-form-urlencoded")
-            };
-            verifyRequest.Headers.Add("Referer", TDurl);
-            verifyRequest.Headers.Add("Origin", baseUrl);
-            verifyRequest.Headers.Add("X-Requested-With", "XMLHttpRequest");
-
-            var verifyResponse = await client.SendAsync(verifyRequest, cts.Token);
-            var verifyBody = await verifyResponse.Content.ReadAsStringAsync();
-            Console.WriteLine($"  Status: {(int)verifyResponse.StatusCode}");
-            Console.WriteLine($"  Response: {verifyBody}");
-
-            // ── STEP 3: POST login ──
-            Console.WriteLine("\nSTEP 3: POST login...");
-            var loginUrl = $"{baseUrl}/login.phtml";  // NOT index.phtml
-
-            var postData = new FormUrlEncodedContent(new[]
-            {
-                new KeyValuePair<string, string>("mode", "attempt"),
-                new KeyValuePair<string, string>("username", TDuser),
-                new KeyValuePair<string, string>("random", TDpass),
-            });
-
-            var loginRequest = new HttpRequestMessage(HttpMethod.Post, loginUrl)
-            {
-                Content = postData
-            };
-            loginRequest.Headers.Add("Referer", TDurl);
-            loginRequest.Headers.Add("Origin", baseUrl);
-
-            var loginResponse = await client.SendAsync(loginRequest, cts.Token);
-            var loginBody = await loginResponse.Content.ReadAsStringAsync();
-
-            Console.WriteLine($"  Status: {(int)loginResponse.StatusCode}");
-            if (loginResponse.Headers.Location != null)
-                Console.WriteLine($"  Redirect: {loginResponse.Headers.Location}");
-
-            // Check if session cookie changed
-            var step3Cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-            foreach (System.Net.Cookie c in step3Cookies)
-                Console.WriteLine($"  Cookie: {c.Name} = {c.Value}");
-
-            Console.WriteLine($"  Status: {(int)loginResponse.StatusCode}");
-            Console.WriteLine($"  Body length: {loginBody.Length}");
-
-            var hasLoginForm = loginBody.Contains("id=\"username\"", StringComparison.OrdinalIgnoreCase)
-                || loginBody.Contains("id='username'", StringComparison.OrdinalIgnoreCase);
-            Console.WriteLine($"  Still on login page: {hasLoginForm}");
-
-            // Find any error text near "invalid" or "incorrect"
-            foreach (var pattern in new[] { "invalid", "incorrect", "denied", "failed", "error" })
-            {
-                var i = loginBody.IndexOf(pattern, StringComparison.OrdinalIgnoreCase);
-                if (i >= 0)
-                {
-                    var ctx = loginBody[Math.Max(0, i - 30)..Math.Min(loginBody.Length, i + 80)];
-                    Console.WriteLine($"  Found '{pattern}': ...{ctx}...");
-                }
-            }
-
-            //Console.WriteLine($"\n  First 500 chars:");
-            //Console.WriteLine(loginBody[..Math.Min(500, loginBody.Length)]);
-
-            cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-            Console.WriteLine($"\n  Cookies: {cookies.Count}");
-            foreach (System.Net.Cookie c in cookies)
-                Console.WriteLine($"    {c.Name} = {c.Value}");
-        }
-        catch (OperationCanceledException)
-        {
-            Console.WriteLine("  TIMEOUT");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  ERROR: {ex.GetType().Name}: {ex.Message}");
-        }
-
-        Console.WriteLine("\nDone.");
-    }
-    //private static async Task RunTDPortalAutomation()
-    //{
-    //    Console.WriteLine("Launching browser...");
-    //    using var playwright = await Playwright.CreateAsync();
-    //    await using var browser = await playwright.Chromium.LaunchAsync(
-    //        new BrowserTypeLaunchOptions
-    //        {
-    //            Headless = false,
-    //            Channel = "chrome",
-    //            Args = new[] { "--disable-blink-features=AutomationControlled" }
-    //        });
-
-    //    var context = await browser.NewContextAsync(new BrowserNewContextOptions
-    //    {
-    //        IgnoreHTTPSErrors = true,
-    //        AcceptDownloads = true
-    //    });
-    //    var page = await context.NewPageAsync();
-
-    //    await page.AddInitScriptAsync(@"
-    //    Object.defineProperty(navigator, 'webdriver', { get: () => false });
-    //");
-
-    //    await page.GotoAsync(
-    //        TDurl,
-    //        new PageGotoOptions { WaitUntil = WaitUntilState.DOMContentLoaded });
-    //    await page.WaitForSelectorAsync("#username");
-    //    await page.WaitForTimeoutAsync(3000);
-    //    Console.WriteLine("Page loaded.");
-
-    //    // ── FIRST PAGE LOGIN ──────────────────
-    //    await page.ClickAsync("#username");
-    //    await page.FillAsync("#username", "");
-    //    await page.Keyboard.TypeAsync(
-    //        TDuser,
-    //        new KeyboardTypeOptions { Delay = 50 });
-
-    //    await page.ClickAsync("#random");
-    //    await page.FillAsync("#random", "");
-    //    await page.Keyboard.TypeAsync(
-    //        TDpass,
-    //        new KeyboardTypeOptions { Delay = 50 });
-
-    //    Console.WriteLine($"Username: {TDuser}");
-    //    Console.WriteLine($"Password: {TDpass}");
-    //    Console.WriteLine($"Password length: {TDpass.Length}");
-    //    Console.WriteLine($"Password bytes: {string.Join(" ", System.Text.Encoding.UTF8.GetBytes(TDpass).Select(b => $"{b:X2}"))}");
-    //    // Submit and try to catch popup
-    //    IPage popup = null;
-    //    try
-    //    {
-    //        var popupTask = context.WaitForPageAsync(new BrowserContextWaitForPageOptions
-    //        {
-    //            Timeout = 10000
-    //        });
-    //        await page.ClickAsync("input[type='submit']");
-    //        popup = await popupTask;
-    //        Console.WriteLine("Popup opened.");
-    //    }
-    //    catch
-    //    {
-    //        // No popup — login might have happened on the same page
-    //        Console.WriteLine("No popup. Checking current page...");
-    //        popup = page;
-    //    }
-
-    //    // ── SECOND PAGE LOGIN (if popup opened) ──
-    //    await popup.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-    //    await popup.WaitForTimeoutAsync(2000);
-
-    //    var hasLoginForm = await popup.EvalOnSelectorAllAsync<int>("#username", "els => els.length");
-    //    if (hasLoginForm > 0 && popup != page)
-    //    {
-    //        Console.WriteLine("Second login form found. Filling...");
-    //        await popup.ClickAsync("#username");
-    //        await popup.FillAsync("#username", "");
-    //        await popup.Keyboard.TypeAsync(
-    //            Environment.GetEnvironmentVariable("PORTAL2_USER") ?? "REPLACE_ME",
-    //            new KeyboardTypeOptions { Delay = 50 });
-
-    //        await popup.ClickAsync("#random");
-    //        await popup.FillAsync("#random", "");
-    //        await popup.Keyboard.TypeAsync(
-    //            Environment.GetEnvironmentVariable("PORTAL2_PASS") ?? "REPLACE_ME",
-    //            new KeyboardTypeOptions { Delay = 50 });
-
-    //        await popup.PressAsync("#random", "Enter");
-    //        await popup.WaitForTimeoutAsync(3000);
-    //    }
-
-    //    // ── CHECK LOGIN ───────────────────────
-    //    var hasError = await popup.EvalOnSelectorAllAsync<int>("div.alert", "els => els.length");
-    //    if (hasError > 0)
-    //    {
-    //        var errorText = await popup.EvalOnSelectorAsync<string>("div.alert", "el => el.innerText");
-    //        Console.WriteLine($"Login FAILED: {errorText}");
-    //        Console.ReadLine();
-    //        return;
-    //    }
-    //    Console.WriteLine("Logged in.");
-
-    //    // ── CLICK REPORTS ─────────────────────
-    //    await popup.WaitForSelectorAsync("#REPORTS");
-    //    await popup.ClickAsync("#REPORTS");
-    //    await popup.WaitForTimeoutAsync(3000);
-
-    //    // ── SELECT REPORT ─────────────────────
-    //    var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
-    //    await mainFrame.WaitForSelectorAsync("select[name='report_seq']");
-    //    await mainFrame.SelectOptionAsync("select[name='report_seq']",
-    //        new SelectOptionValue { Value = "16" });
-    //    Console.WriteLine("Report selected.");
-
-    //    // ── GENERATE REPORT (new window) ──────
-    //    var reportPageTask = context.WaitForPageAsync();
-    //    await mainFrame.ClickAsync("text=Generate Report");
-    //    var reportPage = await reportPageTask;
-
-    //    await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-    //    await reportPage.WaitForTimeoutAsync(3000);
-
-    //    // ── SET DATE RANGE ────────────────────
-    //    IFrame dateFrame = null;
-    //    foreach (var f in reportPage.Frames)
-    //    {
-    //        try
-    //        {
-    //            var found = await f.EvalOnSelectorAllAsync<int>("input#start_date", "els => els.length");
-    //            if (found > 0)
-    //            {
-    //                dateFrame = f;
-    //                Console.WriteLine($"Found date inputs in frame: name='{f.Name}'");
-    //                break;
-    //            }
-    //        }
-    //        catch { }
-    //    }
-
-    //    var today = DateTime.Today;
-    //    var firstOfMonth = new DateTime(today.Year, today.Month, 1).ToString("yyyy-MM-dd");
-    //    var todayStr = today.ToString("yyyy-MM-dd");
-
-    //    await dateFrame.EvalOnSelectorAsync("#start_date",
-    //        $"el => {{ el.value = '{firstOfMonth}'; el.dispatchEvent(new Event('change')); }}");
-    //    await dateFrame.EvalOnSelectorAsync("#end_date",
-    //        $"el => {{ el.value = '{todayStr}'; el.dispatchEvent(new Event('change')); }}");
-    //    Console.WriteLine($"Date range set: {firstOfMonth} to {todayStr}");
-
-    //    // ── RENDER REPORT ─────────────────────
-    //    await dateFrame.ClickAsync("text=Render Report");
-    //    Console.WriteLine("Render Report clicked.");
-
-    //    await reportPage.WaitForTimeoutAsync(30000);
-    //    Console.WriteLine("Wait complete.");
-
-    //    // ── EXPORT ────────────────────────────
-    //    IFrame exportFrame = null;
-    //    foreach (var f in reportPage.Frames)
-    //    {
-    //        try
-    //        {
-    //            var found = await f.EvalOnSelectorAllAsync<int>("#_export_button", "els => els.length");
-    //            if (found > 0)
-    //            {
-    //                exportFrame = f;
-    //                Console.WriteLine($"Found export button in frame: name='{f.Name}'");
-    //                break;
-    //            }
-    //        }
-    //        catch { }
-    //    }
-
-    //    var download = await reportPage.RunAndWaitForDownloadAsync(async () =>
-    //    {
-    //        await exportFrame.ClickAsync("#_export_button");
-    //    });
-
-    //    // TODO: Update save path for this portal's report
-    //    var savePath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\PORTAL2 REPORT.csv";
-
-    //    if (File.Exists(savePath))
-    //        File.Delete(savePath);
-
-    //    await download.SaveAsAsync(savePath);
-    //    Console.WriteLine($"Downloaded: {savePath}");
-
-    //    Console.WriteLine("Automation completed.");
-    //    await Task.Delay(5000);
-    //    await browser.CloseAsync();
     //}
 
     private static async Task RunPerformanceReportAutomation()
