@@ -1,8 +1,6 @@
 ﻿using ClosedXML.Excel;
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
-using DocumentFormat.OpenXml.Packaging;
-using DocumentFormat.OpenXml.Spreadsheet;
 using DocumentFormat.OpenXml.Spreadsheet;
 using ExcelDataReader;
 using Microsoft.Extensions.Configuration;
@@ -10,8 +8,11 @@ using Microsoft.Playwright;
 using Renci.SshNet;
 using System.Data;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using Excel = Microsoft.Office.Interop.Excel;
+using Path = System.IO.Path;
 using Table = DocumentFormat.OpenXml.Spreadsheet.Table;
 
 namespace DailyRevenueReportAutomation;
@@ -32,6 +33,7 @@ internal static class Program
     static string CIBCuser = config["CIBCPortal:Username"];
     static string CIBCpass = config["CIBCPortal:Password"];
     static string? localCsv = null;
+    [STAThread]
     private static async Task Main(string[] args)
     {
         try
@@ -43,6 +45,7 @@ internal static class Program
 
             //TD Portal automation to download the report CSV directly
             //RunTDPortalAutomation().GetAwaiter().GetResult();
+            
             CopyReportValuesToRevenueWorkbook();
 
             //CIBC Portal automation to download the report CSV directly
@@ -61,6 +64,22 @@ internal static class Program
         {
             Console.Error.WriteLine($"ERROR: {ex.Message}");
             //return 1;
+        }
+    }
+    static string DescribeLock(string path)
+    {
+        try
+        {
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                return null;   // we got exclusive access — nothing is holding it
+        }
+        catch (IOException ex)
+        {
+            return $"LOCKED: {ex.Message}";
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            return $"PERMISSION DENIED (not a lock): {ex.Message}";
         }
     }
 
@@ -124,10 +143,6 @@ internal static class Program
         Console.WriteLine("Report selected.");
 
         var criteriaFrame = popup.Frame("report_criteria");
-        var bodyText = await criteriaFrame.EvaluateAsync<string>("() => document.body.innerText");
-        Console.WriteLine("=== report_criteria body text (post-reset) ===");
-        Console.WriteLine(bodyText);
-
 
         await mainFrame.ClickAsync("text=Generate Report");
         Console.WriteLine("Generate Report clicked.");
@@ -135,9 +150,9 @@ internal static class Program
         // Give report_check.phtml's POST and the resulting GET time to complete
         await popup.WaitForTimeoutAsync(5000);
 
-        Console.WriteLine($"Total pages in context: {context.Pages.Count}");
-        foreach (var p in context.Pages)
-            Console.WriteLine($"  Page: {p.Url}");
+        //Console.WriteLine($"Total pages in context: {context.Pages.Count}");
+        //foreach (var p in context.Pages)
+        //    Console.WriteLine($"  Page: {p.Url}");
 
         IFrame reportFrame = null;
         IPage reportPage = null;
@@ -258,19 +273,31 @@ internal static class Program
 
                 var row = new object[6];
                 // replace these with the ACTUAL column meanings — don't auto-detect
-                row[0] = csv.GetField(0);                     // A: text/ID → string
-                row[1] = csv.GetField(1);                     // B: text → string
+                row[0] = ParseDecimal(csv.GetField(0));                     // A: text/ID → string
+                row[1] = ParseDecimal(csv.GetField(1));                     // B: text → string
                 row[2] = ParseDecimal(csv.GetField(2));        // C: amount → double
                 row[3] = ParseDecimal(csv.GetField(3));        // D: amount → double
                 row[4] = ParseDecimal(csv.GetField(4));         // E: date → DateTime?
-                row[5] = csv.GetField(5);                     // F: text → string
+                row[5] = ParseDecimal(csv.GetField(5));                     // F: text → string
                 sourceRows.Add(row);
             }
         }
 
-        static object ParseDecimal(string raw) =>
-            double.TryParse(raw, System.Globalization.NumberStyles.Any,
-                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (object)raw;
+        static object ParseDecimal(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+
+            var cleaned = raw.Trim();
+            bool negParens = cleaned.StartsWith("(") && cleaned.EndsWith(")");
+            if (negParens) cleaned = cleaned.Substring(1, cleaned.Length - 2);
+            cleaned = cleaned.Replace("$", "").Replace(",", "").Trim();
+
+            if (double.TryParse(cleaned, NumberStyles.Float | NumberStyles.AllowLeadingSign,
+                CultureInfo.InvariantCulture, out var d))
+                return negParens ? -Math.Abs(d) : d;
+
+            return raw; // genuinely unparseable — keep as text rather than silently dropping it
+        }
 
         // ── 3. FIND THE DESTINATION WORKBOOK ──
         var destFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
@@ -290,44 +317,276 @@ internal static class Program
 
         var destPath = candidates.First();
         Console.WriteLine($"Destination workbook: {destPath}");
+
+        var lockInfo = DescribeLock(destPath);
+        Console.WriteLine(lockInfo ?? "File is free — no lock.");
+
         if (candidates.Count > 1)
             Console.WriteLine($"  WARNING: {candidates.Count} files matched — picked the most recently modified. Others: {string.Join(", ", candidates.Skip(1).Select(Path.GetFileName))}");
+        var formulasBefore = CountFormulas(destPath);
 
-        // ── 4. PASTE VALUES INTO 'TD DATA' STARTING AT H2 ──
-        using (var destWb = new XLWorkbook(destPath, new LoadOptions { RecalculateAllFormulas = false }))
+        var localPath = Path.Combine(Path.GetTempPath(), $"revreport_{Guid.NewGuid():N}.xlsx");
+        File.Copy(destPath, localPath, true);
+        Console.WriteLine($"Working locally: {localPath}");
+        // ================= PHASE 1: OpenXML — write CSV data into TD DATA =================
+        try
         {
-            var destWs = destWb.Worksheet("TD DATA");
-            for (int i = 0; i < sourceRows.Count; i++)
+            using (var destDoc = SpreadsheetDocument.Open(destPath, true))
             {
-                var destRow = 2 + i;
-                for (int c = 0; c < 6; c++)
+                var workbookPart = destDoc.WorkbookPart;
+                var sheet = workbookPart.Workbook.Descendants<Sheet>()
+                    .FirstOrDefault(s => s.Name == "TD DATA");
+                if (sheet == null) throw new InvalidOperationException("Worksheet 'TD DATA' not found.");
+
+                var wsPart = (WorksheetPart)workbookPart.GetPartById(sheet.Id);
+                var worksheet = wsPart.Worksheet;
+
+                var totalRow = (uint)(2 + sourceRows.Count - 1);
+                var cell = worksheet.Descendants<Cell>()
+                             .FirstOrDefault(c => c.CellReference == $"I{totalRow}");
+                Console.WriteLine($"Verify TD DATA I{totalRow} = {cell?.CellValue?.Text}  (expected {sourceRows.Last()[1]})");
+
+                for (int i = 0; i < sourceRows.Count; i++)
+                    for (int c = 0; c < 6; c++)
+                        SetCellValue(worksheet, (uint)(2 + i), (uint)(8 + c), sourceRows[i][c]);
+
+                // Excel won't recalc formulas that depend on H:M unless told to
+                var calc = workbookPart.Workbook.CalculationProperties
+                           ?? workbookPart.Workbook.AppendChild(new CalculationProperties());
+                calc.FullCalculationOnLoad = true;
+                worksheet.Save();
+                workbookPart.Workbook.Save();
+            }   // handle released HERE
+            Console.WriteLine("PHASE 1 OK: TD DATA written, file closed.");
+            WaitForFileFree(localPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("PHASE 1 FAILED:");
+            Console.WriteLine(ex.ToString());
+            throw;
+        }
+
+        // ================= verify the handle really dropped =================
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        WaitForFileFree(localPath);
+
+        // ================= PHASE 2: Interop — Tim Katis + day snapshot =================
+        try
+        {
+            // ---------- 3. verify no formulas were destroyed ----------
+            var formulasAfter = CountFormulas(localPath);
+            foreach (var kv in formulasBefore)
+            {
+                var after = formulasAfter.TryGetValue(kv.Key, out var a) ? a : 0;
+                if (after != kv.Value)
+                    Console.WriteLine($"  WARNING: sheet '{kv.Key}' formula count {kv.Value} → {after}");
+            }
+
+            // ---------- 4. Interop: TD DATA C1:C19 → Tim Katis, then snapshot F into today's column ----------
+            PushToTimKatis(localPath);
+            WaitForFileFree(localPath);
+            WaitForFileFree(destPath);
+            File.Copy(localPath, destPath, true);
+            Console.WriteLine($"Copied back to {destPath}");
+            File.Delete(localPath);
+            Console.WriteLine("PHASE 2 OK.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("PHASE 2 FAILED:");
+            Console.WriteLine(ex.ToString());
+            throw;
+        }
+        finally
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+    }
+    static void FindTodayDayCell(dynamic ws, int today, out int headerRow, out int dayCol)
+    {
+        headerRow = -1; dayCol = -1;
+
+        dynamic used = ws.UsedRange;
+        object[,] vals = used.Value2;          // ONE marshal, 1-based [row, col]
+        int rowOffset = (int)used.Row;
+        int colOffset = (int)used.Column;
+        int rows = vals.GetLength(0);
+        int cols = vals.GetLength(1);
+
+        for (int i = 1; i <= rows; i++)
+        {
+            var hits = new List<KeyValuePair<int, int>>();   // (col index in array, day value)
+            for (int j = 1; j <= cols; j++)
+            {
+                object v = vals[i, j];
+                if (v == null) continue;
+                double d;
+                if (!double.TryParse(Convert.ToString(v), out d)) continue;
+                if (d < 1 || d > 31 || d != Math.Floor(d)) continue;
+                hits.Add(new KeyValuePair<int, int>(j, (int)d));
+            }
+
+            int run = 1;
+            for (int k = 1; k < hits.Count; k++)
+            {
+                run = (hits[k].Value == hits[k - 1].Value + 1) ? run + 1 : 1;
+                if (run >= 4)                                  // looks like a day-header row
                 {
-                    var destCol = 8 + c;
-                    var raw = sourceRows[i][c];
-                    try
+                    foreach (var h in hits)
                     {
-                        destWs.Cell(destRow, destCol).Value = ToXLCellValue(raw);
+                        if (h.Value == today)
+                        {
+                            headerRow = rowOffset + i - 1;
+                            dayCol = colOffset + h.Key - 1;
+                            return;
+                        }
                     }
-                    catch (Exception ex)
-                    {
-                        throw new InvalidOperationException(
-                            $"Failed at source row {i + 3} (dest row {destRow}), column {(char)('A' + c)} " +
-                            $"(dest col {destCol}). Value: '{raw}' (type: {raw?.GetType().Name ?? "null"}). {ex.Message}", ex);
-                    }
+                    break;                                     // right row shape, today not present — keep looking
                 }
             }
-
-            destWb.CalculateMode = XLCalculateMode.Manual; // don't recalc on save either
-
-            try
+        }
+    }
+    static Dictionary<string, int> CountFormulas(string path)
+    {
+        var counts = new Dictionary<string, int>();
+        using (var doc = SpreadsheetDocument.Open(path, false))
+        {
+            var wbPart = doc.WorkbookPart;
+            foreach (var sheet in wbPart.Workbook.Descendants<Sheet>())
             {
-                destWb.Save();
-                Console.WriteLine($"Saved {sourceRows.Count} rows into '{Path.GetFileName(destPath)}' → TD DATA!H2.");
+                var wsPart = (WorksheetPart)wbPart.GetPartById(sheet.Id);
+                int n = wsPart.Worksheet.Descendants<CellFormula>().Count();
+                counts[sheet.Name] = n;
             }
-            catch (IOException ex)
+        }
+        return counts;
+    }
+    static void WaitForFileFree(string path, int timeoutMs = 30000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string last = null;
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            last = DescribeLock(path);
+            if (last == null)
             {
-                throw new IOException($"Could not save '{destPath}' — it may be open elsewhere. Close it and re-run.", ex);
+                if (sw.ElapsedMilliseconds > 0)
+                    Console.WriteLine($"  File free after {sw.ElapsedMilliseconds} ms.");
+                return;
             }
+            System.Threading.Thread.Sleep(250);
+        }
+        throw new IOException($"File still locked after {timeoutMs} ms: {last}");
+    }
+    static void PushToTimKatis(string destPath)
+    {
+        const string TD_SHEET = "TD DATA";
+        const string DEST_SHEET = "Tim Katis";
+        const int DEST_TOTAL_ROW = 180;
+        const int DEST_FIRST_ROW = 181;
+        const int DEST_LAST_ROW = 198;
+        const int DEST_CODE_COL = 4;   // D
+        const int DEST_VALUE_COL = 5;   // E
+        const int DEST_RESULT_COL = 6;   // F
+
+        var excelType = Type.GetTypeFromProgID("Excel.Application");
+        if (excelType == null)
+            throw new InvalidOperationException("Excel is not installed on this machine.");
+
+        dynamic app = Activator.CreateInstance(excelType);
+        dynamic wb = null;
+        try
+        {
+            ExcelMessageFilter.Register();
+
+            app.Visible = true;
+            app.DisplayAlerts = false;
+
+            wb = app.Workbooks.Open(destPath);
+            dynamic tdWs = wb.Sheets[TD_SHEET];
+            dynamic dstWs = wb.Sheets[DEST_SHEET];
+
+            // ---- code → value map from TD DATA A2:A19 / C2:C19 ----
+            var tdMap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            for (int r = 2; r <= 19; r++)
+            {
+                object rawCode = tdWs.Cells[r, 1].Value2;      // dynamic → object HERE
+                string code = Convert.ToString(rawCode)?.Trim();
+                if (string.IsNullOrWhiteSpace(code)) continue;
+
+                object rawVal = tdWs.Cells[r, 3].Value2;
+                tdMap[code] = rawVal == null ? 0d : Convert.ToDouble(rawVal);
+            }
+
+            object rawTotal = tdWs.Cells[1, 3].Value2;          // C1
+            dstWs.Cells[DEST_TOTAL_ROW, DEST_VALUE_COL].Value2 =
+                rawTotal == null ? 0d : Convert.ToDouble(rawTotal);
+
+            // ---- matched BY CODE, not by position ----
+            var problems = new List<string>();
+            var unused = new HashSet<string>(tdMap.Keys, StringComparer.OrdinalIgnoreCase);
+
+            for (int r = DEST_FIRST_ROW; r <= DEST_LAST_ROW; r++)
+            {
+                object rawCode = dstWs.Cells[r, DEST_CODE_COL].Value2;
+                string code = Convert.ToString(rawCode)?.Trim();
+                if (string.IsNullOrWhiteSpace(code)) continue;
+
+                double val;                                     // explicit, not var
+                if (tdMap.TryGetValue(code, out val))
+                {
+                    dstWs.Cells[r, DEST_VALUE_COL].Value2 = val;
+                    unused.Remove(code);
+                }
+                else
+                {
+                    dstWs.Cells[r, DEST_VALUE_COL].Value2 = 0d;
+                    problems.Add($"  row {r}: code '{code}' not in {TD_SHEET} → wrote 0");
+                }
+            }
+            foreach (string left in unused)
+                problems.Add($"  {TD_SHEET} '{left}' ({tdMap[left]:N2}) has no row on {DEST_SHEET} → NOT written");
+
+            if (problems.Count > 0)
+            {
+                Console.WriteLine("WARNING: code mismatches between tabs:");
+                problems.ForEach(Console.WriteLine);
+            }
+
+            app.CalculateFullRebuild();
+
+            // ---- NEW ----
+            int today = DateTime.Today.Day;
+            int headerRow, dayCol;
+            FindTodayDayCell(dstWs, today, out headerRow, out dayCol);
+
+            if (dayCol < 0)
+                throw new InvalidOperationException($"Could not locate a day-header row containing '{today}' on {DEST_SHEET}.");
+
+            Console.WriteLine($"Day-header row {headerRow}; day {today} → column {dayCol}. Verify before trusting this.");
+
+            // ---- snapshot F into that column ----
+            for (int r = DEST_TOTAL_ROW; r <= DEST_LAST_ROW; r++)
+            {
+                object f = dstWs.Cells[r, DEST_RESULT_COL].Value2;
+                dstWs.Cells[r, dayCol].Value2 = f == null ? 0d : Convert.ToDouble(f);
+            }
+
+            wb.Save();
+            Console.WriteLine($"Tim Katis: E{DEST_TOTAL_ROW}:E{DEST_LAST_ROW} updated; F snapshot → column {dayCol} (day {today}).");
+        }
+        finally
+        {
+            if (wb != null) { wb.Close(false); Marshal.ReleaseComObject(wb); wb = null; }
+            if (app != null) { app.Quit(); Marshal.ReleaseComObject(app); app = null; }
+            ExcelMessageFilter.Revoke();
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            GC.Collect(); GC.WaitForPendingFinalizers();
         }
     }
 
@@ -1197,7 +1456,7 @@ internal static class Program
                 if ((int)headerVal == today)
                 {
                     targetCol = c;
-                    Console.WriteLine($"  Today is day {today}, matched column {GetColumnLetter(c - 1)} (col {c})");
+                    //Console.WriteLine($"  Today is day {today}, matched column {GetColumnLetter(c - 1)} (col {c})");
                     break;
                 }
             }
@@ -1213,7 +1472,7 @@ internal static class Program
         // ══════════════════════════════════════════════════════
         // STEP 10: Paste results to Tim Katis tab
         // ══════════════════════════════════════════════════════
-        Console.WriteLine($"STEP 10: Pasting results to {GetColumnLetter(targetCol - 1)}117:{GetColumnLetter(targetCol - 1)}{timStartRow + results.Count - 1}...");
+        //Console.WriteLine($"STEP 10: Pasting results to {GetColumnLetter(targetCol - 1)}117:{GetColumnLetter(targetCol - 1)}{timStartRow + results.Count - 1}...");
         for (int i = 0; i < results.Count; i++)
         {
             timSheet.Cell(timStartRow + i, targetCol).Value = results[i];
@@ -1327,16 +1586,75 @@ internal static class Program
         wb.SaveAs(xlsxPath);
         Console.WriteLine($"  Converted to: {Path.GetFileName(xlsxPath)}");
     }
-    private static string GetColumnLetter(int colIndex)
+    static void SetCellValue(Worksheet worksheet, uint rowIndex, uint colIndex, object value)
     {
-        var result = "";
-        var n = colIndex;
-        while (n >= 0)
+        string cellRef = $"{GetColumnLetter(colIndex)}{rowIndex}";
+        var sheetData = worksheet.GetFirstChild<SheetData>();
+
+        var row = sheetData.Elements<Row>().FirstOrDefault(r => r.RowIndex == rowIndex);
+        if (row == null)
         {
-            result = (char)('A' + n % 26) + result;
-            n = n / 26 - 1;
+            row = new Row { RowIndex = rowIndex };
+            var rowAfter = sheetData.Elements<Row>().FirstOrDefault(r => r.RowIndex > rowIndex);
+            if (rowAfter != null) sheetData.InsertBefore(row, rowAfter); else sheetData.Append(row);
         }
-        return result;
+
+        var cell = row.Elements<Cell>().FirstOrDefault(c => c.CellReference == cellRef);
+        if (cell == null)
+        {
+            // NEW cell — no template formatting to inherit. Flag this if it happens a lot;
+            // it means sourceRows.Count exceeds the pre-formatted template range.
+            cell = new Cell { CellReference = cellRef };
+            var cellAfter = row.Elements<Cell>()
+                .FirstOrDefault(c => string.Compare(c.CellReference.Value, cellRef, StringComparison.OrdinalIgnoreCase) > 0);
+            if (cellAfter != null) row.InsertBefore(cell, cellAfter); else row.Append(cell);
+        }
+
+        cell.CellFormula = null; // never leave a stale formula behind a literal value
+
+        switch (value)
+        {
+            case null:
+                cell.CellValue = null;
+                cell.DataType = null;
+                break;
+            case string s:
+                cell.DataType = CellValues.InlineString;
+                cell.InlineString = new InlineString(new Text(s));
+                cell.CellValue = null;
+                break;
+            case bool b:
+                cell.DataType = CellValues.Boolean;
+                cell.CellValue = new CellValue(b ? "1" : "0");
+                cell.InlineString = null;
+                break;
+            case DateTime dt:
+                cell.DataType = null; // numeric; relies on the cell's EXISTING number format to render as a date
+                cell.CellValue = new CellValue(dt.ToOADate().ToString(CultureInfo.InvariantCulture));
+                cell.InlineString = null;
+                break;
+            case double d:
+                cell.DataType = null;
+                cell.CellValue = new CellValue(d.ToString(CultureInfo.InvariantCulture));
+                cell.InlineString = null;
+                break;
+            default:
+                cell.DataType = CellValues.InlineString;
+                cell.InlineString = new InlineString(new Text(value.ToString()));
+                cell.CellValue = null;
+                break;
+        }
+    }
+    static string GetColumnLetter(uint colIndex)
+    {
+        string letter = "";
+        while (colIndex > 0)
+        {
+            uint rem = (colIndex - 1) % 26;
+            letter = (char)('A' + rem) + letter;
+            colIndex = (colIndex - 1) / 26;
+        }
+        return letter;
     }
     private static void StripOdbcConnection(string reportPath)
     {
