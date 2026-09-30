@@ -47,7 +47,7 @@ internal static class Program
             //CIBC Portal automation to download the report CSV directly
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
-            //ApplyManualAdjustments();
+            RunOnSta(ApplyManualAdjustments);
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -602,6 +602,8 @@ internal static class Program
     }
     private static void ApplyManualAdjustments()
     {
+        var log = new List<string>();
+        Log($"  Apartment: {Thread.CurrentThread.GetApartmentState()}");
         var revReportDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
         var adjustmentsRoot = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\Manual Adjustments";
         var revManualTab = "Manual Adjustments";
@@ -610,7 +612,6 @@ internal static class Program
         const int DeskCol = 4, DayStartCol = 9, DayEndCol = 41;
 
         var now = DateTime.Now;
-        var log = new List<string>();
         void Log(string m) { Console.WriteLine(m); log.Add($"{DateTime.Now:HH:mm:ss}  {m}"); }
 
         // Parse a tab name to a date: handles "Aug 17", "August 17", "Jul 30", "July 30".
@@ -713,130 +714,168 @@ internal static class Program
         Log($"  Found {adjustments.Count} adjustments.");
         if (adjustments.Count == 0) { Log("  Nothing to post."); FlushLog(); return; }
 
-        // 4. Write into the Rev Report
+        // 4. Write into the Rev Report — Interop on a LOCAL COPY
+        var revLocal = Path.Combine(Path.GetTempPath(), $"revreport_{Guid.NewGuid():N}.xlsx");
+        File.Copy(revReportFile, revLocal, true);
+        bool saved = false;
+
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
         try
         {
-            //using (var doc = SpreadsheetDocument.Open(revReportFile, isEditable: true))
-            using (var doc = SpreadsheetDocument.Open(revReportFile, true, new OpenSettings { AutoSave = false }))
+            xl = new Excel.Application
             {
-                var (manPart, manData) = GetSheet(doc, revManualTab);
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
+            wb = xl.Workbooks.Open(revLocal, UpdateLinks: 0);
 
-                uint last = manData.Elements<Row>()
-                        .Where(r => r.Elements<Cell>().Any(c =>
-                            !string.IsNullOrEmpty(c.CellValue?.Text) ||
-                            c.InlineString != null))
-                        .Select(r => r.RowIndex?.Value ?? 0u)
-                        .DefaultIfEmpty(1u)
-                        .Max();
-                uint writeRow = last + 1;
+            Excel.Worksheet GetWs(string name)
+            {
+                foreach (Excel.Worksheet w in wb.Worksheets)
+                    if (w.Name.Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) return w;
+                throw new InvalidOperationException($"Tab '{name}' not found.");
+            }
 
-                // double-post guard: bail if today already appears in column B
-                foreach (var r in manData.Elements<Row>())
-                {
-                    var bCell = r.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) == 2);
-                    if (GetNumber(bCell) is double oa && oa >= -657435 && oa <= 2958465
-    && DateTime.FromOADate(oa).Date == now.Date)
+            // ── 4a. Manual Adjustments tab: last used row across B:G ──
+            var man = GetWs(revManualTab);
+            int last = 1;
+            for (int c = 2; c <= 7; c++)
+            {
+                int r = ((Excel.Range)man.Cells[man.Rows.Count, c]).End[Excel.XlDirection.xlUp].Row;
+                if (r > last) last = r;
+            }
+
+            // double-post guard: today already in column B?
+            var bCol = man.Range[$"B1:B{last}"].Value2 as object[,];
+            if (bCol != null)
+                for (int i = 1; i <= bCol.GetLength(0); i++)
+                    if (bCol[i, 1] is double oa && oa > 0 && oa < 2958465 && DateTime.FromOADate(oa).Date == now.Date)
                     {
-                        var cVals = string.Join(" | ", r.Elements<Cell>()
-                            .OrderBy(c => ColIndex(c.CellReference))
-                            .Select(c => $"{c.CellReference}={c.CellValue?.Text}"));
-                        Log($"  ABORT: row {r.RowIndex?.Value} already today. Contents: {cVals}");
+                        Log($"  ABORT: row {i} on '{revManualTab}' already has today's date. Nothing written.");
                         FlushLog(); return;
                     }
-                }
 
-                foreach (var a in adjustments)
-                {
-                    Log($"    row: date={a.Date:MM/dd/yyyy} collector={a.Collector} debt={a.Debt} comm={a.Comm} from={a.From} to={a.ToAgent}");
-                    var above = manData.Elements<Row>()
-                    .FirstOrDefault(r => r.RowIndex != null && r.RowIndex.Value == writeRow - 1);
-                    uint? bS = above?.Elements<Cell>()
-                        .FirstOrDefault(c => ColIndex(c.CellReference) == 2)?.StyleIndex?.Value;
-                    uint? cS = above?.Elements<Cell>()
-                        .FirstOrDefault(c => ColIndex(c.CellReference) == 3)?.StyleIndex?.Value;
-
-                    var row = GetOrCreateRow(manData, writeRow);
-                    SetDate(GetOrCreateCell(row, 2), now.Date, bS);
-                    SetDate(GetOrCreateCell(row, 3), a.Date, cS);
-                    SetText(GetOrCreateCell(row, 4), a.Debt);
-                    SetText(GetOrCreateCell(row, 5), a.From);
-                    SetText(GetOrCreateCell(row, 6), a.ToAgent);
-                    SetNumber(GetOrCreateCell(row, 7), a.Comm);
-                    writeRow++;
-                }
-                //manPart.Worksheet.Save();
-
-                // ── agent-tab apply ──
-                // Pre-scan every agent tab's Desk column (D) once: normalized name -> matches across all tabs
-                var deskIndex = new Dictionary<string, List<(string tab, WorksheetPart part, uint row)>>();
-                foreach (var tabName in agentTabs)
-                {
-                    var (aPart, aData) = GetSheet(doc, tabName);
-                    foreach (var r in aData.Elements<Row>())
-                    {
-                        if (r.RowIndex == null) continue;
-                        var dCell = r.Elements<Cell>().FirstOrDefault(c => ColIndex(c.CellReference) == DeskCol);
-                        var key = Normalize(GetCellText(dCell, doc));
-                        if (key.Length == 0) continue;
-                        if (!deskIndex.TryGetValue(key, out var lst)) deskIndex[key] = lst = new();
-                        lst.Add((tabName, aPart, r.RowIndex.Value));
-                    }
-                }
-
-                var touched = new HashSet<WorksheetPart>();
-                int applied = 0, skipped = 0;
-                Log("\nApplying to agent tabs...");
-                foreach (var a in adjustments)
-                {
-                    int day = a.Date.Day;
-                    string rec = $"[{a.Date:MM/dd} debt {a.Debt} ${a.Comm:F2} from '{a.From}' to '{a.ToAgent}']";
-
-                    deskIndex.TryGetValue(Normalize(a.From), out var fromM);
-                    deskIndex.TryGetValue(Normalize(a.ToAgent), out var toM);
-
-                    string reason =
-                        (fromM == null || fromM.Count == 0) ? $"FROM '{a.From}' not found in any Desk (D) column"
-                      : (fromM.Count > 1) ? $"FROM '{a.From}' matches {fromM.Count} desks (ambiguous)"
-                      : (toM == null || toM.Count == 0) ? $"TO '{a.ToAgent}' not found in any Desk (D) column"
-                      : (toM.Count > 1) ? $"TO '{a.ToAgent}' matches {toM.Count} desks (ambiguous)"
-                      : null;
-
-                    if (reason == null)
-                    {
-                        var (fTab, fPart, fRow) = fromM[0];
-                        var (tTab, tPart, tRow) = toM[0];
-                        var fCol = FindDayColumn(fPart, doc, day, DayStartCol, DayEndCol);
-                        var tCol = FindDayColumn(tPart, doc, day, DayStartCol, DayEndCol);
-                        if (fCol == null) reason = $"day {day} column not found on '{fTab}'";
-                        else if (tCol == null) reason = $"day {day} column not found on '{tTab}'";
-                        else
-                        {
-                            var fCell = GetOrCreateCell(GetOrCreateRow(fPart.Worksheet.GetFirstChild<SheetData>(), fRow), (int)fCol.Value);
-                            var tCell = GetOrCreateCell(GetOrCreateRow(tPart.Worksheet.GetFirstChild<SheetData>(), tRow), (int)tCol.Value);
-                            double fOld = GetNumber(fCell) ?? 0, tOld = GetNumber(tCell) ?? 0;
-                            SetNumber(fCell, fOld - a.Comm);      // deduct from FROM desk
-                            SetNumber(tCell, tOld + a.Comm);      // credit TO desk
-                            touched.Add(fPart); touched.Add(tPart);
-                            applied++;
-                            Log($"  OK   {rec}: {fTab} {ColName((int)fCol.Value)}{fRow} {fOld:F2}->{fOld - a.Comm:F2}  |  {tTab} {ColName((int)tCol.Value)}{tRow} {tOld:F2}->{tOld + a.Comm:F2}");
-                        }
-                    }
-
-                    if (reason != null) { Log($"  SKIP {rec}: {reason}"); skipped++; }
-                }
-                Log($"\nApplied {applied}, Skipped {skipped}.");
-
-                // ── persist everything at once (nothing was saved before this point) ──
-                manPart.Worksheet.Save();
-                foreach (var p in touched) p.Worksheet.Save();
-
-                var wb = doc.WorkbookPart.Workbook;
-                wb.CalculationProperties ??= wb.AppendChild(new CalculationProperties());
-                wb.CalculationProperties.FullCalculationOnLoad = true;
-                foreach (var pc in doc.WorkbookPart.GetPartsOfType<PivotTableCacheDefinitionPart>())
-                { pc.PivotCacheDefinition.RefreshOnLoad = true; pc.PivotCacheDefinition.Save(); }
-                wb.Save();
+            // write all adjustment rows in one block B:G
+            int first = last + 1;
+            var block = new object[adjustments.Count, 6];
+            for (int i = 0; i < adjustments.Count; i++)
+            {
+                var a = adjustments[i];
+                block[i, 0] = now.Date.ToOADate();
+                block[i, 1] = a.Date.ToOADate();
+                block[i, 2] = a.Debt;
+                block[i, 3] = a.From;
+                block[i, 4] = a.ToAgent;
+                block[i, 5] = a.Comm;
+                Log($"    row {first + i}: date={a.Date:MM/dd/yyyy} debt={a.Debt} comm={a.Comm} from={a.From} to={a.ToAgent}");
             }
+            int lastNew = first + adjustments.Count - 1;
+            man.Range[$"B{first}:G{lastNew}"].Value2 = block;
+
+            // copy number formats from the row above so dates/currency display the same
+            for (int c = 2; c <= 7; c++)
+            {
+                var fmt = ((Excel.Range)man.Cells[last, c]).NumberFormat;
+                man.Range[man.Cells[first, c], man.Cells[lastNew, c]].NumberFormat = fmt;
+            }
+
+            // force centre alignment on all new rows
+            var newRows = man.Range[$"B{first}:G{lastNew}"];
+            newRows.HorizontalAlignment = Excel.XlHAlign.xlHAlignCenter;
+            newRows.VerticalAlignment = Excel.XlVAlign.xlVAlignCenter;
+
+            // ── 4b. Desk index across agent tabs (column D) ──
+            var deskIndex = new Dictionary<string, List<(string tab, Excel.Worksheet ws, int row)>>();
+            foreach (var tabName in agentTabs)
+            {
+                var ws = GetWs(tabName);
+                int lastRow = ((Excel.Range)ws.Cells[ws.Rows.Count, DeskCol]).End[Excel.XlDirection.xlUp].Row;
+                var dVals = ws.Range[ws.Cells[1, DeskCol], ws.Cells[lastRow, DeskCol]].Value2 as object[,];
+                if (dVals == null) continue;
+                for (int r = 1; r <= dVals.GetLength(0); r++)
+                {
+                    var key = Normalize(Convert.ToString(dVals[r, 1]));
+                    if (key.Length == 0) continue;
+                    if (!deskIndex.TryGetValue(key, out var lst)) deskIndex[key] = lst = new();
+                    lst.Add((tabName, ws, r));
+                }
+            }
+
+            int? DayCol(Excel.Worksheet ws, int day)
+            {
+                var hdr = (object[,])ws.Range[ws.Cells[1, DayStartCol], ws.Cells[1, DayEndCol]].Value2;
+                for (int c = 1; c <= hdr.GetLength(1); c++)
+                    if (hdr[1, c] is double h && (h < 32 ? (int)h : DateTime.FromOADate(h).Day) == day)
+                        return DayStartCol + c - 1;
+                return null;
+            }
+
+            // add delta without destroying formulas
+            (string before, string after) ApplyDelta(Excel.Range cell, double delta)
+            {
+                var amt = Math.Abs(delta).ToString("0.00", CultureInfo.InvariantCulture);
+                if (cell.HasFormula is bool hf && hf)
+                {
+                    string f = (string)cell.Formula;
+                    cell.Formula = $"{f}{(delta < 0 ? "-" : "+")}{amt}";
+                    return (f, (string)cell.Formula);
+                }
+                double old = cell.Value2 is double d ? d : 0;
+                cell.Value2 = old + delta;
+                return (old.ToString("F2"), (old + delta).ToString("F2"));
+            }
+
+            // ── 4c. Apply ──
+            int applied = 0, skipped = 0;
+            Log("\nApplying to agent tabs...");
+            foreach (var a in adjustments)
+            {
+                string rec = $"[{a.Date:MM/dd} debt {a.Debt} ${a.Comm:F2} from '{a.From}' to '{a.ToAgent}']";
+                deskIndex.TryGetValue(Normalize(a.From), out var fromM);
+                deskIndex.TryGetValue(Normalize(a.ToAgent), out var toM);
+
+                string reason =
+                    (fromM == null || fromM.Count == 0) ? $"FROM '{a.From}' not found in any Desk (D) column"
+                  : fromM.Count > 1 ? $"FROM '{a.From}' matches {fromM.Count} desks (ambiguous)"
+                  : (toM == null || toM.Count == 0) ? $"TO '{a.ToAgent}' not found in any Desk (D) column"
+                  : toM.Count > 1 ? $"TO '{a.ToAgent}' matches {toM.Count} desks (ambiguous)"
+                  : null;
+
+                if (reason == null)
+                {
+                    var (fTab, fWs, fRow) = fromM[0];
+                    var (tTab, tWs, tRow) = toM[0];
+                    var fCol = DayCol(fWs, a.Date.Day);
+                    var tCol = DayCol(tWs, a.Date.Day);
+                    if (fCol == null) reason = $"day {a.Date.Day} column not found on '{fTab}'";
+                    else if (tCol == null) reason = $"day {a.Date.Day} column not found on '{tTab}'";
+                    else
+                    {
+                        var f = ApplyDelta((Excel.Range)fWs.Cells[fRow, fCol.Value], -a.Comm);
+                        var t = ApplyDelta((Excel.Range)tWs.Cells[tRow, tCol.Value], +a.Comm);
+                        applied++;
+                        Log($"  OK   {rec}: {fTab} {ColName(fCol.Value)}{fRow} {f.before} -> {f.after}  |  {tTab} {ColName(tCol.Value)}{tRow} {t.before} -> {t.after}");
+                    }
+                }
+                if (reason != null) { Log($"  SKIP {rec}: {reason}"); skipped++; }
+            }
+            Log($"\nApplied {applied}, Skipped {skipped}.");
+
+            // ── 4d. Recalc, refresh pivots, save ──
+            xl.CalculateFull();
+            try
+            {
+                foreach (Excel.PivotCache pc in wb.PivotCaches()) pc.Refresh();
+            }
+            catch (Exception ex) { Log($"  Pivot refresh warning: {ex.Message}"); }
+
+            wb.Save();
+            saved = true;
+            wb.Close(false); wb = null;
         }
         catch (Exception ex)
         {
@@ -845,6 +884,22 @@ internal static class Program
             FlushLog();
             throw;
         }
+        finally
+        {
+            if (wb != null) wb.Close(false);
+            if (xl != null) { xl.Quit(); Marshal.ReleaseComObject(xl); }
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            GC.Collect(); GC.WaitForPendingFinalizers();
+        }
+
+        // only replace the network file if Excel saved cleanly
+        if (saved)
+        {
+            WaitForFileFree(revReportFile);
+            File.Copy(revLocal, revReportFile, true);
+            Log($"  Copied back to {revReportFile}");
+        }
+        try { File.Delete(revLocal); } catch { }
 
         FlushLog();
         Log("Done.");
