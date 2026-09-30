@@ -38,20 +38,15 @@ internal static class Program
     {
         try
         {
-            //await TestTDPortalHttp();
-
             //Saving all daily ACE transaction to Rev Report
             //GetDailyRevenueACETransactions(args);
 
             //TD Portal automation to download the report CSV directly
             //RunTDPortalAutomation().GetAwaiter().GetResult();
-            
-            CopyReportValuesToRevenueWorkbook();
 
             //CIBC Portal automation to download the report CSV directly
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
-            //RunCibcDrsCalculator();
             //ApplyManualAdjustments();
 
             //Performance Report automation Agency 2 & 4
@@ -66,6 +61,22 @@ internal static class Program
             //return 1;
         }
     }
+    private static void RunOnSta(Action work)
+    {
+        Exception err = null;
+        var t = new Thread(() =>
+        {
+            ExcelMessageFilter.Register();      // your existing class
+            try { work(); }
+            catch (Exception ex) { err = ex; }
+            finally { ExcelMessageFilter.Revoke(); }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        if (err != null) throw new Exception(err.Message, err);
+    }
+
     static string DescribeLock(string path)
     {
         try
@@ -589,7 +600,6 @@ internal static class Program
             GC.Collect(); GC.WaitForPendingFinalizers();
         }
     }
-
     private static void ApplyManualAdjustments()
     {
         var revReportDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
@@ -1231,266 +1241,471 @@ internal static class Program
         }
     }
 
+
     private static void RunCibcDrsCalculator()
     {
-        Console.WriteLine("═══════════════════════════════════════════");
-        Console.WriteLine("  CIBC DRS Calculator");
-        Console.WriteLine($"  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-        Console.WriteLine("═══════════════════════════════════════════");
-
+        Console.WriteLine($"  Apartment: {Thread.CurrentThread.GetApartmentState()}");
         var othersPath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others";
         var revReportPath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
-
         var csvPath = Path.Combine(othersPath, "CIBC POST.csv");
-        // Find the calculator file (might be .xls or .xlsx)
-        var calcPath = Directory.GetFiles(othersPath, "CIBC DRS CALCULATOR*")
-                .FirstOrDefault()
-                ?? throw new FileNotFoundException("CIBC DRS CALCULATOR not found.");
 
-        // Find current month's rev report (e.g. "Rev Report JUNE 2026 V8.xlsx")
-        var currentMonth = DateTime.Now.ToString("MMMM").ToUpper();
-        var currentYear = DateTime.Now.Year;
-        //var revReportFile = Directory.GetFiles(revReportPath, $"Rev Report {currentMonth} {currentYear}*.xlsx")
-        var revReportFile = Directory.GetFiles(revReportPath, $"TESTRevReport.xlsx")
-            .OrderByDescending(f => File.GetLastWriteTime(f))
-            .FirstOrDefault()
-            ?? throw new FileNotFoundException($"Rev Report for {currentMonth} {currentYear} not found.");
+        // The real .xls only — no conversion
+        var calcPath = Directory.GetFiles(othersPath, "CIBC DRS CALCULATOR*.xls")
+            .Where(f => f.EndsWith(".xls", StringComparison.OrdinalIgnoreCase))
+            .Single();
 
-        Console.WriteLine($"  CSV: {Path.GetFileName(csvPath)}");
-        Console.WriteLine($"  Calculator: {Path.GetFileName(calcPath)}");
-        Console.WriteLine($"  Rev Report: {Path.GetFileName(revReportFile)}");
-        Console.WriteLine();
+        // SAME rev report as TD — reuse your TD finder
+        var month = DateTime.Today.ToString("MMMM").ToUpper();
+        var year = DateTime.Today.Year.ToString();
+        var revPath = Directory.GetFiles(revReportPath, "*.xlsx")
+            .Where(f => { var n = Path.GetFileName(f).ToUpper(); return n.Contains(month) && n.Contains(year) && n.Contains("V8"); })
+            .OrderByDescending(File.GetLastWriteTime)
+            .First();
 
-        // ══════════════════════════════════════════════════════
-        // STEP 1: Read CIBC POST.csv and find last data row
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 1: Reading CSV...");
-        var csvLines = File.ReadAllLines(csvPath);
-        var lastDataRow = csvLines.Length - 1; // subtract header row
-                                               // Find actual last row with data in column D (index 3)
-        for (int i = csvLines.Length - 1; i >= 1; i--)
+        Console.WriteLine($"Calculator: {calcPath}\nRev Report: {revPath}");
+
+        // ── CSV: last row with data in D, parsed properly (quoted commas) ──
+        int lastDataRow = 0; double csvTotal = 0;
+        using (var reader = new StreamReader(csvPath))
+        using (var csv = new CsvHelper.CsvReader(reader, CultureInfo.InvariantCulture))
         {
-            var cols = csvLines[i].Split(',');
-            if (cols.Length > 3 && !string.IsNullOrWhiteSpace(cols[3]))
+            int line = 0;
+            while (csv.Read())
             {
-                lastDataRow = i + 1; // 1-based row number including header
-                break;
-            }
-        }
-        Console.WriteLine($"  CSV last data row: {lastDataRow}");
-
-        if (calcPath.EndsWith(".xls", StringComparison.OrdinalIgnoreCase)
-            && !calcPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
-        {
-            Console.WriteLine("  Converting .xls to .xlsx...");
-            var newPath = calcPath + "x"; // .xls → .xlsx
-            ConvertXlsToXlsx(calcPath, newPath);
-            calcPath = newPath;
-        }
-
-        // ══════════════════════════════════════════════════════
-        // STEP 2: Open CIBC DRS CALCULATOR
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 2: Opening calculator...");
-        // Pre-clean: remove the B72 formula that ClosedXML can't parse
-        CleanProblematicFormulas(calcPath);
-        RemoveLegacyFormControls(calcPath);
-
-        using var calcWb = new XLWorkbook(calcPath);
-        var calcWs = calcWb.Worksheet("CIBC"); // adjust sheet name if different
-        Console.WriteLine($"  Sheet: {calcWs.Name}");
-        Console.WriteLine($"  D9 before: '{calcWs.Cell(9, 4).Value}'");
-        Console.WriteLine($"  B9 before: '{calcWs.Cell(9, 2).Value}'");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 3: Update B72 formula with correct last row
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 3: Validating B72...");
-
-        // Read B71 (TOTAL)
-        double b71 = 0;
-        if (calcWs.Cell(71, 2).TryGetValue(out double b71Val))
-            b71 = b71Val;
-
-        // Read D28 (last row total) from the CSV directly
-        double csvTotal = 0;
-        var csvCols = csvLines[lastDataRow - 1].Split(',');
-        if (csvCols.Length > 3)
-            double.TryParse(csvCols[3].Replace("$", "").Replace("\"", "").Trim(),
-                NumberStyles.Any, CultureInfo.InvariantCulture, out csvTotal);
-
-        var difference = b71 - csvTotal;
-        calcWs.Cell(72, 2).Clear();
-        calcWs.Cell(72, 2).Value = difference;
-
-        Console.WriteLine($"  B71 (Total): {b71}");
-        Console.WriteLine($"  CSV D{lastDataRow}: {csvTotal}");
-        Console.WriteLine($"  B72 (Difference): {difference}");
-
-        if (Math.Abs(difference) < 0.01)
-            Console.WriteLine("  Match confirmed.");
-        else
-            Console.WriteLine($"  WARNING: Mismatch of {difference:C2}");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 4: Find dynamic range B9:Bxx (until empty or TOTAL)
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 4: Reading COMM values...");
-        var commValues = new List<double>();
-        int startRow = 9;
-        int endRow = startRow;
-
-        for (int r = startRow; r <= 69; r++)
-        {
-            var nameCell = calcWs.Cell(r, 1).GetString().Trim();
-
-            if (nameCell.Equals("TOTAL", StringComparison.OrdinalIgnoreCase))
-                break;
-
-            double commVal = 0;
-            var bCell = calcWs.Cell(r, 2);
-
-            if (bCell.TryGetValue(out double d))
-            {
-                commVal = d;
-            }
-            else
-            {
-                var text = bCell.GetString().Replace("$", "").Replace(",", "").Trim();
-                double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out commVal);
-            }
-
-            commValues.Add(commVal);
-            endRow = r;
-        }
-        Console.WriteLine($"  Found {commValues.Count} rows ({startRow} to {endRow}), including hidden");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 5: Paste COMM values to D9 onwards
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 5: Pasting COMM to column D...");
-        for (int i = 0; i < commValues.Count; i++)
-        {
-            var cell = calcWs.Cell(startRow + i, 4);
-            cell.Clear();
-            cell.Value = commValues[i];
-        }
-        Console.WriteLine($"  D9 after write: '{calcWs.Cell(9, 4).Value}'");
-        try
-        {
-            calcWb.Save();
-            Console.WriteLine("  Save succeeded.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"  Save FAILED: {ex.Message}");
-        }
-        // ══════════════════════════════════════════════════════
-        // STEP 6: Open Rev Report, go to Tim Katis tab
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 6: Opening Rev Report...");
-        using var revWb = new XLWorkbook(revReportFile);
-        var timSheet = revWb.Worksheets.FirstOrDefault(ws =>
-            ws.Name.Contains("Tim Katis", StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException("'Tim Katis' tab not found in Rev Report.");
-
-        Console.WriteLine($"Found tab: '{timSheet.Name}'");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 7: Grab G117:G177 from Tim Katis
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 7: Reading G117:G177...");
-        int timStartRow = 118;
-        var gValues = new List<double>();
-        for (int i = 0; i < commValues.Count; i++)
-        {
-            int r = timStartRow + i;
-            double val = 0;
-            var gCell = timSheet.Cell(r, 7);
-            var bName = timSheet.Cell(r, 2).GetString().Trim(); // agent name
-            var hidden = timSheet.Row(r).IsHidden;
-
-            if (gCell.TryGetValue(out double d))
-            {
-                val = d;
-            }
-            else
-            {
-                var text = gCell.GetString().Replace("$", "").Replace(",", "").Trim();
-                double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out val);
-            }
-
-            gValues.Add(val);
-
-            // Log first few to verify alignment
-            if (i < 5)
-                Console.WriteLine($"    Row {r}: {bName} = {val} {(hidden ? "(hidden)" : "")}");
-        }
-        Console.WriteLine($"  Read {gValues.Count} values from G column");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 8: Subtract G from D (D - G = result)
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 8: Calculating D - G...");
-        var results = new List<double>();
-        for (int i = 0; i < commValues.Count; i++)
-        {
-            var result = commValues[i] - gValues[i];
-            results.Add(result);
-        }
-        Console.WriteLine($"  Calculated {results.Count} results");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 9: Find today's day column in Tim Katis row 1
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 9: Finding today's column...");
-        var today = DateTime.Now.Day;
-        int targetCol = -1;
-
-        // Search I1:AM1 (columns 9 to 39) for today's day number
-        for (int c = 9; c <= 39; c++) // I=9, AM=39
-        {
-            try
-            {
-                var headerVal = timSheet.Cell(1, c).GetDouble();
-                if ((int)headerVal == today)
+                line++;
+                var d = csv.GetField(3);
+                if (!string.IsNullOrWhiteSpace(d))
                 {
-                    targetCol = c;
-                    //Console.WriteLine($"  Today is day {today}, matched column {GetColumnLetter(c - 1)} (col {c})");
-                    break;
+                    lastDataRow = line;
+                    double.TryParse(d.Replace("$", "").Replace(",", "").Trim(),
+                        NumberStyles.Any, CultureInfo.InvariantCulture, out csvTotal);
                 }
             }
-            catch { }
         }
+        Console.WriteLine($"CSV last data row D{lastDataRow} = {csvTotal}");
 
-        if (targetCol == -1)
+        // ── Work on local copies ──
+        var calcLocal = Path.Combine(Path.GetTempPath(), $"cibccalc_{Guid.NewGuid():N}.xls");
+        var revLocal = Path.Combine(Path.GetTempPath(), $"revreport_{Guid.NewGuid():N}.xlsx");
+        File.Copy(calcPath, calcLocal, true);
+        File.Copy(revPath, revLocal, true);
+
+        Excel.Application xl = null;
+        Excel.Workbook csvWb = null, calcWb = null, revWb = null;
+        try
         {
-            Console.WriteLine($"  ERROR: Could not find day {today} in row 1 (I1:AM1)");
-            return;
-        }
+            xl = new Excel.Application
+            {
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
 
-        // ══════════════════════════════════════════════════════
-        // STEP 10: Paste results to Tim Katis tab
-        // ══════════════════════════════════════════════════════
-        //Console.WriteLine($"STEP 10: Pasting results to {GetColumnLetter(targetCol - 1)}117:{GetColumnLetter(targetCol - 1)}{timStartRow + results.Count - 1}...");
-        for (int i = 0; i < results.Count; i++)
+            // Open the CSV first so any external refs in the calculator resolve to today's data
+            csvWb = xl.Workbooks.Open(csvPath, ReadOnly: true);
+            calcWb = xl.Workbooks.Open(calcLocal, UpdateLinks: 0);
+
+            // Log and re-point every link to CIBC POST.csv at the open network CSV
+            var links = calcWb.LinkSources(Excel.XlLink.xlExcelLinks) as Array;
+            if (links == null)
+                Console.WriteLine("  WARNING: calculator has NO external links — B isn't reading the CSV at all.");
+            else
+                foreach (string link in links)
+                {
+                    Console.WriteLine($"  Link found: {link}");
+                    if (Path.GetFileName(link).Equals("CIBC POST.csv", StringComparison.OrdinalIgnoreCase)
+                        && !link.Equals(csvPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        calcWb.ChangeLink(link, csvPath, Excel.XlLinkType.xlLinkTypeExcelLinks);
+                        Console.WriteLine($"    → re-pointed to {csvPath}");
+                    }
+                }
+
+            xl.CalculateFull();
+
+            var calc = (Excel.Worksheet)calcWb.Worksheets["CIBC"];
+
+            // ── Read A/B from row 9 until TOTAL ──
+            const int startRow = 9;
+            int endRow = startRow;
+            var names = new List<string>(); var comm = new List<double>();
+            for (int r = startRow; r <= 70; r++)
+            {
+                var name = Convert.ToString(((Excel.Range)calc.Cells[r, 1]).Value2)?.Trim() ?? "";
+                if (name.Equals("TOTAL", StringComparison.OrdinalIgnoreCase)) break;
+                var v = ((Excel.Range)calc.Cells[r, 2]).Value2;
+                names.Add(name);
+                comm.Add(v is double d ? d : 0);
+                endRow = r;
+            }
+            Console.WriteLine($"COMM rows {startRow}-{endRow} ({comm.Count})");
+
+            // ── Paste COMM values to D (values only, one range write) ──
+            var dVals = new object[comm.Count, 1];
+            for (int i = 0; i < comm.Count; i++) dVals[i, 0] = comm[i];
+            calc.Range[$"D{startRow}:D{endRow}"].Value2 = dVals;
+
+            // ── B72: keep it a formula ──
+            // Check this matches what the original B72 formula looked like
+            calc.Range["B72"].Formula = $"=B71-'[CIBC POST.csv]CIBC POST'!$D${lastDataRow}";
+
+            xl.Calculate();
+
+            var diff = Convert.ToDouble(calc.Range["B72"].Value2);
+            // ── Abort if calculator doesn't tie to CSV ──
+            if (Math.Abs(diff) >= 0.01)
+                throw new InvalidOperationException($"B72 mismatch {diff:C2} — not touching Rev Report.");
+
+            // ══════════════════════════════════════════════
+            // STEP A: B9:B72 → D9:D72 (values only)
+            // ══════════════════════════════════════════════
+            const int calcFirst = 9, calcLast = 69;
+            int n = calcLast - calcFirst + 1;                       // 64 rows
+
+            var bRange = calc.Range[$"B{calcFirst}:B{calcLast}"];
+            var bVals = (object[,])bRange.Value2;                  // 1-based [row, col]
+            calc.Range[$"D{calcFirst}:D{calcLast}"].Value2 = bVals; // values, no formulas, no clipboard
+            Console.WriteLine($"  Copied B{calcFirst}:B{calcLast} → D{calcFirst}:D{calcLast}");
+
+            // read D back as numbers
+            var dNums = new double[n];
+            var cNames = new string[n];
+            var aVals = (object[,])calc.Range[$"A{calcFirst}:A{calcLast}"].Value2;
+            for (int i = 0; i < n; i++)
+            {
+                dNums[i] = bVals[i + 1, 1] is double d ? d : 0;
+                cNames[i] = Convert.ToString(aVals[i + 1, 1])?.Trim() ?? "";
+            }
+
+            // ══════════════════════════════════════════════
+            // STEP B: Open Rev Report (calculator + CSV stay open)
+            // ══════════════════════════════════════════════
+            File.Copy(revPath, revLocal, true);
+            revWb = xl.Workbooks.Open(revLocal, UpdateLinks: 0);
+            xl.CalculateFull();
+
+            Excel.Worksheet tim = null;
+            foreach (Excel.Worksheet w in revWb.Worksheets)
+                if (w.Name.IndexOf("Tim Katis", StringComparison.OrdinalIgnoreCase) >= 0) { tim = w; break; }
+            if (tim == null) throw new InvalidOperationException("'Tim Katis' tab not found.");
+
+            // ══════════════════════════════════════════════
+            // STEP C: Read Tim Katis G, compute D − G
+            // ══════════════════════════════════════════════
+            const int timFirst = 116;                               // CONFIRM 117 vs 118
+            int timLast = timFirst + n - 1;
+            var gVals = (object[,])tim.Range[$"G{timFirst}:G{timLast}"].Value2;
+            var tNames = (object[,])tim.Range[$"B{timFirst}:B{timLast}"].Value2;
+
+            var result = new object[n, 1];
+            for (int i = 0; i < n; i++)
+            {
+                double g = gVals[i + 1, 1] is double gd ? gd : 0;
+                result[i, 0] = dNums[i] - g;
+                Console.WriteLine($"  calc r{calcFirst + i,-3} {cNames[i],-25} | tim r{timFirst + i,-3} {Convert.ToString(tNames[i + 1, 1]),-40} | {dNums[i],12:N2} - {g,12:N2} = {dNums[i] - g,12:N2}");
+            }
+
+            // ══════════════════════════════════════════════
+            // STEP D: Today's column in Tim Katis → paste results
+            // ══════════════════════════════════════════════
+            int targetCol = -1;
+            var header = (object[,])tim.Range["I1:AM1"].Value2;
+            for (int c = 1; c <= header.GetLength(1); c++)
+                if (header[1, c] is double h && (h < 32 ? (int)h : DateTime.FromOADate(h).Day) == DateTime.Today.Day)
+                { targetCol = 8 + c; break; }                       // I = col 9
+            if (targetCol == -1) throw new InvalidOperationException($"Day {DateTime.Today.Day} not in Tim Katis I1:AM1.");
+
+            tim.Range[tim.Cells[timFirst, targetCol], tim.Cells[timLast, targetCol]].Value2 = result;
+            Console.WriteLine($"  Pasted {n} results to Tim Katis col {targetCol}, rows {timFirst}-{timLast}");
+
+            // ══════════════════════════════════════════════
+            // SAVE everything, THEN close
+            // ══════════════════════════════════════════════
+            calcWb.CheckCompatibility = false;
+            calcWb.Save();
+            revWb.Save();
+
+            revWb.Close(false); revWb = null;
+            calcWb.Close(false); calcWb = null;
+            csvWb.Close(false); csvWb = null;
+        }
+        finally
         {
-            timSheet.Cell(timStartRow + i, targetCol).Value = results[i];
+            if (calcWb != null) calcWb.Close(false);
+            if (csvWb != null) csvWb.Close(false);
+            if (revWb != null) revWb.Close(false);
+            if (xl != null) { xl.Quit(); Marshal.ReleaseComObject(xl); }
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            GC.Collect(); GC.WaitForPendingFinalizers();
         }
 
-        // ══════════════════════════════════════════════════════
-        // SAVE
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("\nSaving...");
-        calcWb.Save();
-        Console.WriteLine($"  Saved: {Path.GetFileName(calcPath)}");
-        revWb.Save();
-        Console.WriteLine($"  Saved: {Path.GetFileName(revReportFile)}");
-
-        Console.WriteLine("\n═══════════════════════════════════════════");
-        Console.WriteLine("  CIBC DRS Calculator complete.");
-        Console.WriteLine("═══════════════════════════════════════════");
+        WaitForFileFree(calcPath); File.Copy(calcLocal, calcPath, true);
+        WaitForFileFree(revPath); File.Copy(revLocal, revPath, true);
+        File.Delete(calcLocal); File.Delete(revLocal);
+        Console.WriteLine("CIBC DRS Calculator complete.");
     }
+    //private static void RunCibcDrsCalculator()
+    //{
+    //    Console.WriteLine("═══════════════════════════════════════════");
+    //    Console.WriteLine("  CIBC DRS Calculator");
+    //    Console.WriteLine($"  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+    //    Console.WriteLine("═══════════════════════════════════════════");
+
+    //    var othersPath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others";
+    //    var revReportPath = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+
+    //    var csvPath = Path.Combine(othersPath, "CIBC POST.csv");
+    //    // Find the calculator file (might be .xls or .xlsx)
+    //    var calcPath = Directory.GetFiles(othersPath, "CIBC DRS CALCULATOR*")
+    //            .FirstOrDefault()
+    //            ?? throw new FileNotFoundException("CIBC DRS CALCULATOR not found.");
+
+    //    // Find current month's rev report (e.g. "Rev Report JUNE 2026 V8.xlsx")
+    //    var currentMonth = DateTime.Now.ToString("MMMM").ToUpper();
+    //    var currentYear = DateTime.Now.Year;
+    //    //var revReportFile = Directory.GetFiles(revReportPath, $"Rev Report {currentMonth} {currentYear}*.xlsx")
+    //    var revReportFile = Directory.GetFiles(revReportPath, $"TESTRevReport.xlsx")
+    //        .OrderByDescending(f => File.GetLastWriteTime(f))
+    //        .FirstOrDefault()
+    //        ?? throw new FileNotFoundException($"Rev Report for {currentMonth} {currentYear} not found.");
+
+    //    Console.WriteLine($"  CSV: {Path.GetFileName(csvPath)}");
+    //    Console.WriteLine($"  Calculator: {Path.GetFileName(calcPath)}");
+    //    Console.WriteLine($"  Rev Report: {Path.GetFileName(revReportFile)}");
+    //    Console.WriteLine();
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 1: Read CIBC POST.csv and find last data row
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 1: Reading CSV...");
+    //    var csvLines = File.ReadAllLines(csvPath);
+    //    var lastDataRow = csvLines.Length - 1; // subtract header row
+    //                                           // Find actual last row with data in column D (index 3)
+    //    for (int i = csvLines.Length - 1; i >= 1; i--)
+    //    {
+    //        var cols = csvLines[i].Split(',');
+    //        if (cols.Length > 3 && !string.IsNullOrWhiteSpace(cols[3]))
+    //        {
+    //            lastDataRow = i + 1; // 1-based row number including header
+    //            break;
+    //        }
+    //    }
+    //    Console.WriteLine($"  CSV last data row: {lastDataRow}");
+
+    //    if (calcPath.EndsWith(".xls", StringComparison.OrdinalIgnoreCase)
+    //        && !calcPath.EndsWith(".xlsx", StringComparison.OrdinalIgnoreCase))
+    //    {
+    //        Console.WriteLine("  Converting .xls to .xlsx...");
+    //        var newPath = calcPath + "x"; // .xls → .xlsx
+    //        ConvertXlsToXlsx(calcPath, newPath);
+    //        calcPath = newPath;
+    //    }
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 2: Open CIBC DRS CALCULATOR
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 2: Opening calculator...");
+    //    // Pre-clean: remove the B72 formula that ClosedXML can't parse
+    //    CleanProblematicFormulas(calcPath);
+    //    RemoveLegacyFormControls(calcPath);
+
+    //    using var calcWb = new XLWorkbook(calcPath);
+    //    var calcWs = calcWb.Worksheet("CIBC"); // adjust sheet name if different
+    //    Console.WriteLine($"  Sheet: {calcWs.Name}");
+    //    Console.WriteLine($"  D9 before: '{calcWs.Cell(9, 4).Value}'");
+    //    Console.WriteLine($"  B9 before: '{calcWs.Cell(9, 2).Value}'");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 3: Update B72 formula with correct last row
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 3: Validating B72...");
+
+    //    // Read B71 (TOTAL)
+    //    double b71 = 0;
+    //    if (calcWs.Cell(71, 2).TryGetValue(out double b71Val))
+    //        b71 = b71Val;
+
+    //    // Read D28 (last row total) from the CSV directly
+    //    double csvTotal = 0;
+    //    var csvCols = csvLines[lastDataRow - 1].Split(',');
+    //    if (csvCols.Length > 3)
+    //        double.TryParse(csvCols[3].Replace("$", "").Replace("\"", "").Trim(),
+    //            NumberStyles.Any, CultureInfo.InvariantCulture, out csvTotal);
+
+    //    var difference = b71 - csvTotal;
+    //    calcWs.Cell(72, 2).Clear();
+    //    calcWs.Cell(72, 2).Value = difference;
+
+    //    Console.WriteLine($"  B71 (Total): {b71}");
+    //    Console.WriteLine($"  CSV D{lastDataRow}: {csvTotal}");
+    //    Console.WriteLine($"  B72 (Difference): {difference}");
+
+    //    if (Math.Abs(difference) < 0.01)
+    //        Console.WriteLine("  Match confirmed.");
+    //    else
+    //        Console.WriteLine($"  WARNING: Mismatch of {difference:C2}");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 4: Find dynamic range B9:Bxx (until empty or TOTAL)
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 4: Reading COMM values...");
+    //    var commValues = new List<double>();
+    //    int startRow = 9;
+    //    int endRow = startRow;
+
+    //    for (int r = startRow; r <= 69; r++)
+    //    {
+    //        var nameCell = calcWs.Cell(r, 1).GetString().Trim();
+
+    //        if (nameCell.Equals("TOTAL", StringComparison.OrdinalIgnoreCase))
+    //            break;
+
+    //        double commVal = 0;
+    //        var bCell = calcWs.Cell(r, 2);
+
+    //        if (bCell.TryGetValue(out double d))
+    //        {
+    //            commVal = d;
+    //        }
+    //        else
+    //        {
+    //            var text = bCell.GetString().Replace("$", "").Replace(",", "").Trim();
+    //            double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out commVal);
+    //        }
+
+    //        commValues.Add(commVal);
+    //        endRow = r;
+    //    }
+    //    Console.WriteLine($"  Found {commValues.Count} rows ({startRow} to {endRow}), including hidden");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 5: Paste COMM values to D9 onwards
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 5: Pasting COMM to column D...");
+    //    for (int i = 0; i < commValues.Count; i++)
+    //    {
+    //        var cell = calcWs.Cell(startRow + i, 4);
+    //        cell.Clear();
+    //        cell.Value = commValues[i];
+    //    }
+    //    Console.WriteLine($"  D9 after write: '{calcWs.Cell(9, 4).Value}'");
+    //    try
+    //    {
+    //        calcWb.Save();
+    //        Console.WriteLine("  Save succeeded.");
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        Console.WriteLine($"  Save FAILED: {ex.Message}");
+    //    }
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 6: Open Rev Report, go to Tim Katis tab
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 6: Opening Rev Report...");
+    //    using var revWb = new XLWorkbook(revReportFile);
+    //    var timSheet = revWb.Worksheets.FirstOrDefault(ws =>
+    //        ws.Name.Contains("Tim Katis", StringComparison.OrdinalIgnoreCase))
+    //        ?? throw new InvalidOperationException("'Tim Katis' tab not found in Rev Report.");
+
+    //    Console.WriteLine($"Found tab: '{timSheet.Name}'");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 7: Grab G117:G177 from Tim Katis
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 7: Reading G117:G177...");
+    //    int timStartRow = 118;
+    //    var gValues = new List<double>();
+    //    for (int i = 0; i < commValues.Count; i++)
+    //    {
+    //        int r = timStartRow + i;
+    //        double val = 0;
+    //        var gCell = timSheet.Cell(r, 7);
+    //        var bName = timSheet.Cell(r, 2).GetString().Trim(); // agent name
+    //        var hidden = timSheet.Row(r).IsHidden;
+
+    //        if (gCell.TryGetValue(out double d))
+    //        {
+    //            val = d;
+    //        }
+    //        else
+    //        {
+    //            var text = gCell.GetString().Replace("$", "").Replace(",", "").Trim();
+    //            double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out val);
+    //        }
+
+    //        gValues.Add(val);
+
+    //        // Log first few to verify alignment
+    //        if (i < 5)
+    //            Console.WriteLine($"    Row {r}: {bName} = {val} {(hidden ? "(hidden)" : "")}");
+    //    }
+    //    Console.WriteLine($"  Read {gValues.Count} values from G column");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 8: Subtract G from D (D - G = result)
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 8: Calculating D - G...");
+    //    var results = new List<double>();
+    //    for (int i = 0; i < commValues.Count; i++)
+    //    {
+    //        var result = commValues[i] - gValues[i];
+    //        results.Add(result);
+    //    }
+    //    Console.WriteLine($"  Calculated {results.Count} results");
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 9: Find today's day column in Tim Katis row 1
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("STEP 9: Finding today's column...");
+    //    var today = DateTime.Now.Day;
+    //    int targetCol = -1;
+
+    //    // Search I1:AM1 (columns 9 to 39) for today's day number
+    //    for (int c = 9; c <= 39; c++) // I=9, AM=39
+    //    {
+    //        try
+    //        {
+    //            var headerVal = timSheet.Cell(1, c).GetDouble();
+    //            if ((int)headerVal == today)
+    //            {
+    //                targetCol = c;
+    //                //Console.WriteLine($"  Today is day {today}, matched column {GetColumnLetter(c - 1)} (col {c})");
+    //                break;
+    //            }
+    //        }
+    //        catch { }
+    //    }
+
+    //    if (targetCol == -1)
+    //    {
+    //        Console.WriteLine($"  ERROR: Could not find day {today} in row 1 (I1:AM1)");
+    //        return;
+    //    }
+
+    //    // ══════════════════════════════════════════════════════
+    //    // STEP 10: Paste results to Tim Katis tab
+    //    // ══════════════════════════════════════════════════════
+    //    //Console.WriteLine($"STEP 10: Pasting results to {GetColumnLetter(targetCol - 1)}117:{GetColumnLetter(targetCol - 1)}{timStartRow + results.Count - 1}...");
+    //    for (int i = 0; i < results.Count; i++)
+    //    {
+    //        timSheet.Cell(timStartRow + i, targetCol).Value = results[i];
+    //    }
+
+    //    // ══════════════════════════════════════════════════════
+    //    // SAVE
+    //    // ══════════════════════════════════════════════════════
+    //    Console.WriteLine("\nSaving...");
+    //    calcWb.Save();
+    //    Console.WriteLine($"  Saved: {Path.GetFileName(calcPath)}");
+    //    revWb.Save();
+    //    Console.WriteLine($"  Saved: {Path.GetFileName(revReportFile)}");
+
+    //    Console.WriteLine("\n═══════════════════════════════════════════");
+    //    Console.WriteLine("  CIBC DRS Calculator complete.");
+    //    Console.WriteLine("═══════════════════════════════════════════");
+    //}
 
     private static void CleanProblematicFormulas(string filePath)
     {
@@ -2464,144 +2679,9 @@ internal static class Program
         Console.WriteLine("CIBC Automation completed.");
         await Task.Delay(5000);
         await browser.CloseAsync();
+
+        RunOnSta(RunCibcDrsCalculator);
     }
-
-    //private static async Task TestTDPortalHttp()
-    //{
-    //    Console.WriteLine("Testing TD Portal HTTP...\n");
-
-    //    var handler = new HttpClientHandler
-    //    {
-    //        ServerCertificateCustomValidationCallback = (_, _, _, _) => true,
-    //        AllowAutoRedirect = true,
-    //        CookieContainer = new System.Net.CookieContainer()
-    //    };
-
-    //    using var client = new HttpClient(handler);
-    //    var baseUrl = "https://10.21.178.100";
-    //    var userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-    //    client.DefaultRequestHeaders.Add("User-Agent", userAgent);
-
-    //    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
-    //    try
-    //    {
-    //        // ── STEP 1: GET login page (establish session cookie) ──
-    //        Console.WriteLine("STEP 1: GET login page...");
-    //        var getResponse = await client.GetAsync(TDurl, cts.Token);
-    //        Console.WriteLine($"  Status: {(int)getResponse.StatusCode}");
-
-    //        var cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-    //        Console.WriteLine($"  Session cookie: {cookies[0]?.Name} = {cookies[0]?.Value}");
-
-    //        // ── STEP 2: POST browser verification (mimic requestVerifyBrowser JS) ──
-    //        Console.WriteLine("\nSTEP 2: POST browser_verification.php...");
-
-    //        // This is what bowser.parse() produces for our user agent
-    //        var browserInfo = new
-    //        {
-    //            request_dtl = new
-    //            {
-    //                name = "Chrome",
-    //                version = "131.0.0.0",
-    //                engine = "Blink",
-    //                user_agent = userAgent,
-    //                os = "Windows",
-    //                os_version = "10"
-    //            },
-    //            user_agent = userAgent
-    //        };
-
-    //        var jsonContent = new StringContent(
-    //            System.Text.Json.JsonSerializer.Serialize(browserInfo),
-    //            System.Text.Encoding.UTF8,
-    //            "application/json"  // bowser sends as JSON, not form data
-    //        );
-
-    //        var verifyRequest = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/browser_verification.php")
-    //        {
-    //            Content = jsonContent
-    //        };
-    //        verifyRequest.Headers.Add("Referer", TDurl);
-    //        verifyRequest.Headers.Add("Origin", baseUrl);
-    //        verifyRequest.Headers.Add("X-Requested-With", "XMLHttpRequest"); // it's an XHR call
-
-    //        var verifyResponse = await client.SendAsync(verifyRequest, cts.Token);
-    //        var verifyBody = await verifyResponse.Content.ReadAsStringAsync();
-    //        Console.WriteLine($"  Status: {(int)verifyResponse.StatusCode}");
-    //        Console.WriteLine($"  Response: {verifyBody}");
-
-    //        // Check cookies after verification
-    //        cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-    //        Console.WriteLine($"  Cookies: {cookies.Count}");
-    //        foreach (System.Net.Cookie c in cookies)
-    //            Console.WriteLine($"    {c.Name} = {c.Value}");
-
-    //        // ── STEP 3: POST login with mode=attempt ──
-    //        Console.WriteLine("\nSTEP 3: POST login...");
-    //        var postData = new FormUrlEncodedContent(new[]
-    //        {
-    //        new KeyValuePair<string, string>("username", TDuser),
-    //        new KeyValuePair<string, string>("random", TDpass),
-    //        new KeyValuePair<string, string>("mode", "attempt"),
-    //    });
-
-    //        var loginRequest = new HttpRequestMessage(HttpMethod.Post, TDurl)
-    //        {
-    //            Content = postData
-    //        };
-    //        loginRequest.Headers.Add("Referer", TDurl);
-    //        loginRequest.Headers.Add("Origin", baseUrl);
-
-    //        var loginResponse = await client.SendAsync(loginRequest, cts.Token);
-    //        var loginBody = await loginResponse.Content.ReadAsStringAsync();
-
-    //        Console.WriteLine($"  Status: {(int)loginResponse.StatusCode}");
-    //        Console.WriteLine($"  Body length: {loginBody.Length}");
-
-    //        // Check for redirect (success) vs same page (failure)
-    //        if (loginResponse.Headers.Location != null)
-    //            Console.WriteLine($"  Redirect: {loginResponse.Headers.Location}");
-
-    //        // Check for error messages
-    //        var hasError = loginBody.Contains("invalid", StringComparison.OrdinalIgnoreCase)
-    //            || loginBody.Contains("incorrect", StringComparison.OrdinalIgnoreCase);
-    //        var hasLoginForm = loginBody.Contains("id=\"username\"", StringComparison.OrdinalIgnoreCase);
-
-    //        Console.WriteLine($"  Has error message: {hasError}");
-    //        Console.WriteLine($"  Still on login page: {hasLoginForm}");
-    //        Console.WriteLine($"  First 1000 chars:");
-    //        Console.WriteLine(loginBody[..Math.Min(1000, loginBody.Length)]);
-
-    //        // Updated cookies
-    //        cookies = handler.CookieContainer.GetCookies(new Uri(baseUrl));
-    //        Console.WriteLine($"\n  Cookies after login: {cookies.Count}");
-    //        foreach (System.Net.Cookie c in cookies)
-    //            Console.WriteLine($"    {c.Name} = {c.Value}");
-
-    //        // ── STEP 4: If login succeeded, try main page ──
-    //        if (!hasLoginForm)
-    //        {
-    //            Console.WriteLine("\nSTEP 4: Accessing main page...");
-    //            var mainResponse = await client.GetAsync($"{baseUrl}/main.phtml", cts.Token);
-    //            var mainBody = await mainResponse.Content.ReadAsStringAsync();
-    //            Console.WriteLine($"  Status: {(int)mainResponse.StatusCode}");
-    //            Console.WriteLine($"  Body length: {mainBody.Length}");
-    //            Console.WriteLine($"  First 500 chars:");
-    //            Console.WriteLine(mainBody[..Math.Min(500, mainBody.Length)]);
-    //        }
-    //    }
-    //    catch (OperationCanceledException)
-    //    {
-    //        Console.WriteLine("  TIMEOUT");
-    //    }
-    //    catch (Exception ex)
-    //    {
-    //        Console.WriteLine($"  ERROR: {ex.GetType().Name}: {ex.Message}");
-    //    }
-
-    //    Console.WriteLine("\nDone.");
-    //}
 
     private static async Task RunPerformanceReportAutomation()
     {
