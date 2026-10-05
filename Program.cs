@@ -7,6 +7,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Playwright;
 using Renci.SshNet;
 using System.Data;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -38,16 +39,19 @@ internal static class Program
     {
         try
         {
+            //TD Portal automation to download the report CSV directly
+            RunTDPortalAutomation().GetAwaiter().GetResult();
+
             //Saving all daily ACE transaction to Rev Report
             //GetDailyRevenueACETransactions(args);
-
-            //TD Portal automation to download the report CSV directly
-            //RunTDPortalAutomation().GetAwaiter().GetResult();
+            //CopyReportValuesToRevenueWorkbook();
 
             //CIBC Portal automation to download the report CSV directly
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
-            RunOnSta(ApplyManualAdjustments);
+            //RunOnSta(RunCmhc);
+
+            //RunOnSta(ApplyManualAdjustments);
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -61,6 +65,240 @@ internal static class Program
             //return 1;
         }
     }
+
+    private static void RunCmhc()
+    {
+        var today = DateTime.Today;
+        var monthName = today.ToString("MMMM", CultureInfo.InvariantCulture);
+        var cmhcDir = Path.Combine(@"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\CMHC", monthName);
+        var revDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+
+        int[] cmhcRows = { 202, 203 };            // Tim Katis rows to check
+        const int NameCol = 4;                    // D
+        const int FormulaCol = 5;                 // E
+        const int DayStartCol = 9, DayEndCol = 41;// I..AO
+        const int ColDate = 11, ColAmt = 14, ColName = 19;   // L, O, T (0-based)
+
+        Console.WriteLine("═══════════════════════════════════════════");
+        Console.WriteLine($"  CMHC  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine($"  Apartment: {Thread.CurrentThread.GetApartmentState()}");
+        Console.WriteLine("═══════════════════════════════════════════");
+
+        // ── 1. Today's CMHC file, or stop ──
+        if (!Directory.Exists(cmhcDir))
+            throw new DirectoryNotFoundException($"CMHC month folder not found: {cmhcDir}");
+
+        var stamp = today.ToString("yyyyMMdd");
+        var csvPath = Directory.GetFiles(cmhcDir, $"*{stamp}*.csv")
+            .OrderByDescending(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase) // ...yyyyMMddHHmmss sorts by time
+            .ThenByDescending(File.GetLastWriteTime)
+            .FirstOrDefault();
+
+        if (csvPath == null)
+        {
+            Console.WriteLine($"  No CMHC file with {stamp} in {cmhcDir} — stopping, nothing changed.");
+            return;
+        }
+        Console.WriteLine($"  CMHC file: {Path.GetFileName(csvPath)}");
+
+        // ── 2. Read rows 4+ (row 3 = headers), skip Total, keep L = today ──
+        string Norm(string s) => Regex.Replace((s ?? "").ToUpperInvariant().Replace('.', ' '), @"\s+", " ").Trim();
+
+        bool TryDate(string s, out DateTime d) =>
+            DateTime.TryParseExact(s, new[] { "yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss", "M/d/yyyy", "MM/dd/yyyy", "M/d/yyyy h:mm:ss tt" },
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out d)
+            || DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out d);
+
+        bool TryMoney(string s, out double v)
+        {
+            s = (s ?? "").Trim();
+            bool neg = s.StartsWith("(") && s.EndsWith(")");
+            s = s.Trim('(', ')').Replace("$", "").Replace(",", "").Trim();
+            var ok = double.TryParse(s, NumberStyles.Float | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v);
+            if (ok && neg) v = -Math.Abs(v);
+            return ok;
+        }
+
+        var totals = new Dictionary<string, (string display, double amt, int rows)>();
+        var cfg = new CsvHelper.Configuration.CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            HasHeaderRecord = false,
+            BadDataFound = null,
+            MissingFieldFound = null
+        };
+        using (var reader = new StreamReader(csvPath))
+        using (var csv = new CsvHelper.CsvReader(reader, cfg))
+        {
+            string F(int i) => csv.TryGetField<string>(i, out var v) ? (v ?? "").Trim() : "";
+            int line = 0;
+            while (csv.Read())
+            {
+                line++;
+                if (line < 3) continue;
+                if (line == 3)
+                {
+                    Console.WriteLine($"  Headers → L='{F(ColDate)}'  O='{F(ColAmt)}'  T='{F(ColName)}'");
+                    continue;
+                }
+
+                bool isTotal = Enumerable.Range(0, csv.Parser.Count)
+                    .Any(i => F(i).StartsWith("Total", StringComparison.OrdinalIgnoreCase));
+                if (isTotal) { Console.WriteLine($"  Row {line}: Total row — skipped"); continue; }
+
+                if (!TryDate(F(ColDate), out var d) || d.Date != today) continue;
+
+                var name = F(ColName);
+                if (name.Length == 0) { Console.WriteLine($"  Row {line}: no name in T — skipped"); continue; }
+                if (!TryMoney(F(ColAmt), out var amt)) { Console.WriteLine($"  Row {line}: bad amount '{F(ColAmt)}' — skipped"); continue; }
+
+                var key = Norm(name);
+                totals[key] = totals.TryGetValue(key, out var t) ? (t.display, t.amt + amt, t.rows + 1) : (name, amt, 1);
+                Console.WriteLine($"  Row {line}: {name} {amt:F2}");
+            }
+        }
+
+        if (totals.Count == 0)
+        {
+            Console.WriteLine($"  No rows dated {today:yyyy-MM-dd} in column L — Rev Report not touched.");
+            return;
+        }
+        foreach (var t in totals.Values)
+            Console.WriteLine($"  Total for {t.display}: {t.amt:F2} ({t.rows} row(s))");
+
+        // ── 3. Rev Report (same finder as TD/CIBC: month + year + V8) ──
+        var monthUpper = monthName.ToUpperInvariant();
+        var revPath = Directory.GetFiles(revDir, "*.xlsx")
+            .Where(f => { var n = Path.GetFileName(f).ToUpperInvariant(); return n.Contains(monthUpper) && n.Contains(today.Year.ToString()) && n.Contains("V8"); })
+            .OrderByDescending(File.GetLastWriteTime)
+            .FirstOrDefault()
+            ?? throw new FileNotFoundException($"Rev Report for {monthUpper} {today.Year} (V8) not found.");
+        Console.WriteLine($"  Rev Report: {Path.GetFileName(revPath)}");
+
+        var revLocal = Path.Combine(Path.GetTempPath(), $"revreport_{Guid.NewGuid():N}.xlsx");
+        File.Copy(revPath, revLocal, true);
+
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
+        bool saved = false;
+        try
+        {
+            xl = new Excel.Application
+            {
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
+            wb = ComRetry(() => xl.Workbooks.Open(revLocal, UpdateLinks: 0));
+            WaitForExcelIdle(xl);
+
+            Excel.Worksheet tim = null;
+            foreach (Excel.Worksheet w in wb.Worksheets)
+                if (w.Name.IndexOf("Tim Katis", StringComparison.OrdinalIgnoreCase) >= 0) { tim = w; break; }
+            if (tim == null) throw new InvalidOperationException("'Tim Katis' tab not found.");
+
+            // today's column in row 1
+            int dayCol = -1;
+            var hdr = (object[,])tim.Range[tim.Cells[1, DayStartCol], tim.Cells[1, DayEndCol]].Value2;
+            for (int c = 1; c <= hdr.GetLength(1); c++)
+                if (hdr[1, c] is double h && (h < 32 ? (int)h : DateTime.FromOADate(h).Day) == today.Day)
+                { dayCol = DayStartCol + c - 1; break; }
+            if (dayCol == -1) throw new InvalidOperationException($"Day {today.Day} not found in Tim Katis row 1.");
+            Console.WriteLine($"  Day {today.Day} → column {dayCol}");
+
+            // ── 4. Match D202/D203 and post ──
+            var handled = new HashSet<string>();
+            int changes = 0;
+            foreach (var r in cmhcRows)
+            {
+                var desk = Convert.ToString(((Excel.Range)tim.Cells[r, NameCol]).Value2) ?? "";
+                var key = Norm(desk);
+                if (!totals.TryGetValue(key, out var t))
+                {
+                    Console.WriteLine($"  D{r} '{desk}': no CMHC amount today");
+                    continue;
+                }
+                handled.Add(key);
+
+                var dayCell = (Excel.Range)tim.Cells[r, dayCol];
+                if (dayCell.Value2 is double existing && Math.Abs(existing) > 0.004)
+                {
+                    Console.WriteLine($"  D{r} '{desk}': day cell already {existing:F2} — SKIPPED (already posted? E not changed)");
+                    continue;
+                }
+
+                var amtStr = Math.Abs(t.amt).ToString("0.00", CultureInfo.InvariantCulture);
+                var sign = t.amt < 0 ? "-" : "+";
+
+                dayCell.Value2 = t.amt;
+
+                var eCell = (Excel.Range)tim.Cells[r, FormulaCol];
+                string before;
+                if (eCell.HasFormula is bool hf && hf)
+                {
+                    before = (string)eCell.Formula;
+                    eCell.Formula = $"{before}{sign}{amtStr}";
+                }
+                else
+                {
+                    double old = eCell.Value2 is double ev ? ev : 0;
+                    before = old.ToString("F2", CultureInfo.InvariantCulture);
+                    eCell.Formula = $"={before}{sign}{amtStr}";
+                }
+                changes++;
+                Console.WriteLine($"  D{r} '{desk}': day cell = {t.amt:F2} | E{r}: {before} → {eCell.Formula}");
+            }
+
+            foreach (var kv in totals.Where(kv => !handled.Contains(kv.Key)))
+                Console.WriteLine($"  WARNING: '{kv.Value.display}' {kv.Value.amt:F2} matched neither D{string.Join("/D", cmhcRows)} — NOT posted");
+
+            if (changes > 0)
+            {
+                xl.CalculateFull();
+                WaitForExcelIdle(xl);
+                wb.Save();
+                saved = true;
+            }
+            else Console.WriteLine("  No changes — Rev Report not saved.");
+
+            wb.Close(false); wb = null;
+        }
+        finally
+        {
+            if (wb != null) wb.Close(false);
+            if (xl != null) { xl.Quit(); Marshal.ReleaseComObject(xl); }
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            GC.Collect(); GC.WaitForPendingFinalizers();
+        }
+
+        if (saved)
+        {
+            WaitForFileFree(revPath);
+            File.Copy(revLocal, revPath, true);
+            Console.WriteLine($"  Saved to {revPath}");
+        }
+        try { File.Delete(revLocal); } catch { }
+        Console.WriteLine("CMHC complete.");
+    }
+
+    static T ComRetry<T>(Func<T> call, int timeoutSec = 300)
+    {
+        var sw = Stopwatch.StartNew();
+        while (true)
+        {
+            try { return call(); }
+            catch (COMException ex) when ((uint)ex.HResult == 0x8001010A && sw.Elapsed.TotalSeconds < timeoutSec)
+            { Thread.Sleep(500); }
+        }
+    }
+
+    static void WaitForExcelIdle(Excel.Application xl)
+    {
+        while (ComRetry(() => xl.CalculationState) != Excel.XlCalculationState.xlDone)
+            Thread.Sleep(500);
+    }
+
     private static void RunOnSta(Action work)
     {
         Exception err = null;
@@ -246,18 +484,28 @@ internal static class Program
         var suggested = download.SuggestedFilename;
         var ext = Path.GetExtension(suggested);
         var destFileName = $"TD_{DateTime.Today:MM-dd-yyyy}{ext}";
-        var destFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var tdRoot = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var destFolder = Path.Combine(tdRoot, DateTime.Today.ToString("MMMM", CultureInfo.InvariantCulture));
+
+        Directory.CreateDirectory(destFolder);   // creates TD\September if missing, no-op if it exists
+        Console.WriteLine($"TD folder: {destFolder}");
+
         var destPath = Path.Combine(destFolder, destFileName);
         await download.SaveAsAsync(destPath);
         Console.WriteLine($"Exported to: {destPath}");
 
-        CopyReportValuesToRevenueWorkbook();
+        RunOnSta(CopyReportValuesToRevenueWorkbook);
     }
 
     private static void CopyReportValuesToRevenueWorkbook()
     {
         // ── 1. LOCATE AND VERIFY TODAY'S DOWNLOADED FILE ──
-        var sourceFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var tdRoot = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\TD";
+        var sourceFolder = Path.Combine(tdRoot, DateTime.Today.ToString("MMMM", CultureInfo.InvariantCulture));
+
+        Directory.CreateDirectory(sourceFolder);   // creates TD\September if missing, no-op if it exists
+        Console.WriteLine($"TD folder: {sourceFolder}");
+
         var sourceFileName = $"TD_{DateTime.Today:MM-dd-yyyy}.csv";
         var sourcePath = Path.Combine(sourceFolder, sourceFileName);
 
@@ -312,111 +560,71 @@ internal static class Program
 
         // ── 3. FIND THE DESTINATION WORKBOOK ──
         var destFolder = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
-        var monthName = DateTime.Today.ToString("MMMM").ToUpper(); // e.g. "SEPTEMBER"
-        var yearStr = DateTime.Today.Year.ToString();
-
-        var candidates = Directory.GetFiles(destFolder, "*.xlsx")
-            .Where(f => Path.GetFileName(f).ToUpper().Contains(monthName))
-            .Where(f => Path.GetFileName(f).Contains(yearStr))
-            .Where(f => Path.GetFileName(f).Contains("V8")) // hardcoded per your spec — see note above
-            .OrderByDescending(f => File.GetLastWriteTime(f))
-            .ToList();
-
-        if (candidates.Count == 0)
-            throw new FileNotFoundException(
-                $"No destination workbook found in {destFolder} matching month '{monthName}', year '{yearStr}', and 'V8'.");
-
-        var destPath = candidates.First();
+        var destPath = FindRevReport(destFolder, DateTime.Today, mustContain: "V8");
         Console.WriteLine($"Destination workbook: {destPath}");
 
-        var lockInfo = DescribeLock(destPath);
-        Console.WriteLine(lockInfo ?? "File is free — no lock.");
+        // ── 4. Write TD DATA directly on the server via Excel ──
+        const int FirstRow = 2, FirstCol = 8;     // H2
+        int n = sourceRows.Count;
 
-        if (candidates.Count > 1)
-            Console.WriteLine($"  WARNING: {candidates.Count} files matched — picked the most recently modified. Others: {string.Join(", ", candidates.Skip(1).Select(Path.GetFileName))}");
-        var formulasBefore = CountFormulas(destPath);
-
-        var localPath = Path.Combine(Path.GetTempPath(), $"revreport_{Guid.NewGuid():N}.xlsx");
-        File.Copy(destPath, localPath, true);
-        Console.WriteLine($"Working locally: {localPath}");
-        // ================= PHASE 1: OpenXML — write CSV data into TD DATA =================
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
         try
         {
-            using (var destDoc = SpreadsheetDocument.Open(destPath, true))
+            xl = new Excel.Application
             {
-                var workbookPart = destDoc.WorkbookPart;
-                var sheet = workbookPart.Workbook.Descendants<Sheet>()
-                    .FirstOrDefault(s => s.Name == "TD DATA");
-                if (sheet == null) throw new InvalidOperationException("Worksheet 'TD DATA' not found.");
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
+            wb = ComRetry(() => xl.Workbooks.Open(destPath, UpdateLinks: 0, ReadOnly: false));
+            WaitForExcelIdle(xl);
 
-                var wsPart = (WorksheetPart)workbookPart.GetPartById(sheet.Id);
-                var worksheet = wsPart.Worksheet;
+            if (wb.ReadOnly)
+                throw new InvalidOperationException($"{Path.GetFileName(destPath)} opened READ-ONLY — someone has it open. Close it and rerun.");
 
-                var totalRow = (uint)(2 + sourceRows.Count - 1);
-                var cell = worksheet.Descendants<Cell>()
-                             .FirstOrDefault(c => c.CellReference == $"I{totalRow}");
-                Console.WriteLine($"Verify TD DATA I{totalRow} = {cell?.CellValue?.Text}  (expected {sourceRows.Last()[1]})");
+            Excel.Worksheet td = null;
+            foreach (Excel.Worksheet w in wb.Worksheets)
+                if (w.Name.Trim().Equals("TD DATA", StringComparison.OrdinalIgnoreCase)) { td = w; break; }
+            if (td == null) throw new InvalidOperationException("Worksheet 'TD DATA' not found.");
 
-                for (int i = 0; i < sourceRows.Count; i++)
-                    for (int c = 0; c < 6; c++)
-                        SetCellValue(worksheet, (uint)(2 + i), (uint)(8 + c), sourceRows[i][c]);
+            // clear yesterday's block so leftover rows don't get counted
+            int oldLast = ((Excel.Range)td.Cells[td.Rows.Count, FirstCol]).End[Excel.XlDirection.xlUp].Row;
+            if (oldLast >= FirstRow)
+                td.Range[td.Cells[FirstRow, FirstCol], td.Cells[oldLast, FirstCol + 5]].ClearContents();
 
-                // Excel won't recalc formulas that depend on H:M unless told to
-                var calc = workbookPart.Workbook.CalculationProperties
-                           ?? workbookPart.Workbook.AppendChild(new CalculationProperties());
-                calc.FullCalculationOnLoad = true;
-                worksheet.Save();
-                workbookPart.Workbook.Save();
-            }   // handle released HERE
-            Console.WriteLine("PHASE 1 OK: TD DATA written, file closed.");
-            WaitForFileFree(localPath);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("PHASE 1 FAILED:");
-            Console.WriteLine(ex.ToString());
-            throw;
-        }
+            // write today's block in one go
+            var block = new object[n, 6];
+            for (int i = 0; i < n; i++)
+                for (int c = 0; c < 6; c++)
+                    block[i, c] = sourceRows[i][c];
+            td.Range[td.Cells[FirstRow, FirstCol], td.Cells[FirstRow + n - 1, FirstCol + 5]].Value2 = block;
 
-        // ================= verify the handle really dropped =================
-        GC.Collect();
-        GC.WaitForPendingFinalizers();
-        WaitForFileFree(localPath);
+            xl.CalculateFull();
+            WaitForExcelIdle(xl);
 
-        // ================= PHASE 2: Interop — Tim Katis + day snapshot =================
-        try
-        {
-            // ---------- 3. verify no formulas were destroyed ----------
-            var formulasAfter = CountFormulas(localPath);
-            foreach (var kv in formulasBefore)
-            {
-                var after = formulasAfter.TryGetValue(kv.Key, out var a) ? a : 0;
-                if (after != kv.Value)
-                    Console.WriteLine($"  WARNING: sheet '{kv.Key}' formula count {kv.Value} → {after}");
-            }
+            // verify on the actual server workbook, after the write
+            var lastI = ((Excel.Range)td.Cells[FirstRow + n - 1, FirstCol + 1]).Value2;
+            Console.WriteLine($"Verify TD DATA I{FirstRow + n - 1} = {lastI}  (expected {sourceRows[n - 1][1]})");
 
-            // ---------- 4. Interop: TD DATA C1:C19 → Tim Katis, then snapshot F into today's column ----------
-            PushToTimKatis(localPath);
-            WaitForFileFree(localPath);
-            WaitForFileFree(destPath);
-            File.Copy(localPath, destPath, true);
-            Console.WriteLine($"Copied back to {destPath}");
-            File.Delete(localPath);
-            Console.WriteLine("PHASE 2 OK.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("PHASE 2 FAILED:");
-            Console.WriteLine(ex.ToString());
-            throw;
+            wb.Save();
+            Console.WriteLine("TD DATA written and saved on server.");
+            wb.Close(false); wb = null;
         }
         finally
         {
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
+            if (wb != null) wb.Close(false);
+            if (xl != null) { xl.Quit(); Marshal.ReleaseComObject(xl); }
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            GC.Collect(); GC.WaitForPendingFinalizers();
         }
+
+        // ── 5. Tim Katis — same server file, no copies ──
+        WaitForFileFree(destPath);
+        PushToTimKatis(destPath);
+        Console.WriteLine("TD complete.");
     }
     static void FindTodayDayCell(dynamic ws, int today, out int headerRow, out int dayCol)
     {
@@ -477,7 +685,7 @@ internal static class Program
         }
         return counts;
     }
-    static void WaitForFileFree(string path, int timeoutMs = 30000)
+    static void WaitForFileFree(string path, int timeoutMs = 50000)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         string last = null;
@@ -498,9 +706,9 @@ internal static class Program
     {
         const string TD_SHEET = "TD DATA";
         const string DEST_SHEET = "Tim Katis";
-        const int DEST_TOTAL_ROW = 180;
-        const int DEST_FIRST_ROW = 181;
-        const int DEST_LAST_ROW = 198;
+        const int DEST_TOTAL_ROW = 182;
+        const int DEST_FIRST_ROW = 183;
+        const int DEST_LAST_ROW = 200;
         const int DEST_CODE_COL = 4;   // D
         const int DEST_VALUE_COL = 5;   // E
         const int DEST_RESULT_COL = 6;   // F
@@ -1241,8 +1449,12 @@ internal static class Program
             var filePattern = config["Sftp:FilePattern"] ?? "RevenueReportTransactions-*.csv";
 
             // ── Report settings ───────────────────────────────────────────
-            var reportPath = config["Report:Path"]
-                ?? throw new InvalidOperationException("Report:Path is not configured.");
+            var reportFolder = config["Report:Path"]
+                                    ?? throw new InvalidOperationException("Report:Path is not configured.");
+            var mustContain = config["Report:MustContain"];          // e.g. "V8" — optional
+            var reportPath = FindRevReport(reportFolder, DateTime.Today, mustContain);
+            Console.WriteLine($"Rev Report: {reportPath}");
+
             var sheetName = config["Report:SheetName"] ?? "Trans";
             var numCols = int.Parse(config["Report:NumCols"] ?? "18");
             var dateColIndex = int.Parse(config["Report:DateColIndex"] ?? "7");
@@ -1279,8 +1491,9 @@ internal static class Program
                 Console.WriteLine("No rows to write. Exiting without modifying the report.");
             }
 
-            StripOdbcConnection(reportPath);
-
+            //StripOdbcConnection(reportPath);
+            Console.WriteLine(DescribeLock(reportPath) ?? "File is free.");
+            WaitForFileFree(reportPath);
             // ── 7. Write to Trans tab ─────────────────────────────────────
             WriteToTransTab(filtered, headers, dateIdx, reportPath, sheetName, numCols);
             Console.WriteLine("Done.");
@@ -1296,7 +1509,31 @@ internal static class Program
         }
     }
 
+    private static string FindRevReport(string folder, DateTime forDate, string mustContain = null)
+    {
+        var month = forDate.ToString("MMMM", CultureInfo.InvariantCulture).ToUpperInvariant(); // OCTOBER
+        var year = forDate.Year.ToString();
 
+        var matches = Directory.GetFiles(folder, "*.xlsx")
+            .Where(f =>
+            {
+                var n = Path.GetFileName(f).ToUpperInvariant();
+                return !n.StartsWith("~$")                         // skip Excel lock files
+                    && n.Contains(month) && n.Contains(year)
+                    && (mustContain == null || n.Contains(mustContain.ToUpperInvariant()));
+            })
+            .ToList();
+
+        if (matches.Count == 0)
+            throw new FileNotFoundException($"No Rev Report for {month} {year}{(mustContain != null ? $" containing '{mustContain}'" : "")} in {folder}");
+
+        if (matches.Count > 1)
+            throw new InvalidOperationException(
+                $"{matches.Count} Rev Reports match {month} {year}: {string.Join(", ", matches.Select(Path.GetFileName))}. " +
+                "Set Report:MustContain to pick one.");
+
+        return matches[0];
+    }
     private static void RunCibcDrsCalculator()
     {
         Console.WriteLine($"  Apartment: {Thread.CurrentThread.GetApartmentState()}");
@@ -1417,7 +1654,7 @@ internal static class Program
             // STEP A: B9:B72 → D9:D72 (values only)
             // ══════════════════════════════════════════════
             const int calcFirst = 9, calcLast = 69;
-            int n = calcLast - calcFirst + 1;                       // 64 rows
+            int n = calcLast - calcFirst + 1;                       // 61 rows
 
             var bRange = calc.Range[$"B{calcFirst}:B{calcLast}"];
             var bVals = (object[,])bRange.Value2;                  // 1-based [row, col]
@@ -1449,7 +1686,7 @@ internal static class Program
             // ══════════════════════════════════════════════
             // STEP C: Read Tim Katis G, compute D − G
             // ══════════════════════════════════════════════
-            const int timFirst = 116;                               // CONFIRM 117 vs 118
+            const int timFirst = 118;                               // CONFIRM 117 vs 118
             int timLast = timFirst + n - 1;
             var gVals = (object[,])tim.Range[$"G{timFirst}:G{timLast}"].Value2;
             var tNames = (object[,])tim.Range[$"B{timFirst}:B{timLast}"].Value2;
@@ -2639,7 +2876,7 @@ internal static class Program
         // Wait for the post-login UI (the left nav with "Reports" in your screenshot)
         await popup.WaitForSelectorAsync("#REPORTS");
         await popup.ClickAsync("#REPORTS");
-        await popup.WaitForTimeoutAsync(3000);
+        await popup.WaitForTimeoutAsync(5000);
 
         // Get the frame directly by name
         var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
@@ -2657,7 +2894,7 @@ internal static class Program
         var reportPage = await reportPageTask;
 
         await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-        await reportPage.WaitForTimeoutAsync(3000);
+        await reportPage.WaitForTimeoutAsync(5000);
 
         // Find which frame has the date inputs
         IFrame dateFrame = null;
@@ -2792,7 +3029,7 @@ internal static class Program
         // ── CLICK REPORTS ─────────────────────
         await popup.WaitForSelectorAsync("#REPORTS");
         await popup.ClickAsync("#REPORTS");
-        await popup.WaitForTimeoutAsync(3000);
+        await popup.WaitForTimeoutAsync(5000);
 
         // ── SELECT PERFORMANCE REPORT (seq 38) ─
         var mainFrame = popup.Frames.FirstOrDefault(f => f.Name == "CIBCCRM_MAIN");
@@ -2807,7 +3044,7 @@ internal static class Program
         var reportPage = await reportPageTask;
 
         await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-        await reportPage.WaitForTimeoutAsync(3000);
+        await reportPage.WaitForTimeoutAsync(5000);
 
         // ── FIND THE CRITERIA FRAME ───────────
         IFrame criteriaFrame = null;
@@ -2934,7 +3171,7 @@ internal static class Program
             catch { }
         }
         await editFrame.ClickAsync("text=Edit Criteria");
-        await reportPage.WaitForTimeoutAsync(3000);
+        await reportPage.WaitForTimeoutAsync(5000);
 
         // Re-find the criteria frame (it may have reloaded)
         criteriaFrame = null;
