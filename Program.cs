@@ -34,24 +34,58 @@ internal static class Program
     static string CIBCuser = config["CIBCPortal:Username"];
     static string CIBCpass = config["CIBCPortal:Password"];
     static string? localCsv = null;
+    private static readonly List<string> Failures = new();
+
     [STAThread]
     private static async Task Main(string[] args)
     {
+        // must be set BEFORE capturing Console.Out — setting it later replaces Console.Out
+        Console.OutputEncoding = Encoding.UTF8;
+
+        var logDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\Logs";
+        try { Directory.CreateDirectory(logDir); }
+        catch { logDir = Path.Combine(Path.GetTempPath(), "RevReportLogs"); Directory.CreateDirectory(logDir); }
+
+        var logPath = Path.Combine(logDir, $"RevReport_{DateTime.Today:yyyy-MM-dd}.log");
+        var fileStream = new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        var fileWriter = new StreamWriter(fileStream, Encoding.UTF8) { AutoFlush = true };
+
+        var tee = TextWriter.Synchronized(new TeeWriter(Console.Out, fileWriter));
+        Console.SetOut(tee);
+        Console.SetError(tee);
+
+        AppDomain.CurrentDomain.UnhandledException += (s, e) =>
+            Console.WriteLine($"UNHANDLED: {e.ExceptionObject}");
+
+        Console.WriteLine($"════════ Run started {DateTime.Now:yyyy-MM-dd HH:mm:ss} — log: {logPath} ════════");
+
         try
         {
             //TD Portal automation to download the report CSV directly
-            //RunTDPortalAutomation().GetAwaiter().GetResult();
+            //RunStep("TD portal + Rev Report", () => RunTDPortalAutomation().GetAwaiter().GetResult());
+            //RunStep("ACE transactions → Trans tab", () => GetDailyRevenueACETransactions(args));
 
-            //Saving all daily ACE transaction to Rev Report
-            //GetDailyRevenueACETransactions(args);
-            //CopyReportValuesToRevenueWorkbook();
+            //bool cibcDownloaded = RunStep("CIBC portal download", () => RunCIBCPortalAutomation().GetAwaiter().GetResult());
+            //if (cibcDownloaded)
+            //    RunStep("CIBC DRS Calculator", () => RunOnSta(RunCibcDrsCalculator));
+            //else
+            //{
+            //    Console.WriteLine("──── CIBC DRS Calculator: SKIPPED (download failed — would use stale CSV) ────");
+            //    Failures.Add("CIBC DRS Calculator: skipped because CIBC download failed");
+            //}
 
-            //CIBC Portal automation to download the report CSV directly
-            //RunCIBCPortalAutomation().GetAwaiter().GetResult();
+            //RunStep("CMHC", () => RunOnSta(RunCmhc));
+            ////RunStep("Manual Adjustments", () => RunOnSta(ApplyManualAdjustments));
 
-            RunOnSta(RunCmhc);
-
-            //RunOnSta(ApplyManualAdjustments);
+            //// ── summary at the end, so failures aren't buried mid-log ──
+            //if (Failures.Count == 0)
+            //    Console.WriteLine("ALL STEPS OK.");
+            //else
+            //{
+            //    Console.WriteLine($"{Failures.Count} STEP(S) FAILED:");
+            //    foreach (var f in Failures) Console.WriteLine($"  - {f}");
+            //    Environment.ExitCode = 1;     // Task Scheduler shows the run as failed
+            //}
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -61,8 +95,14 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"ERROR: {ex.Message}");
-            //return 1;
+            Console.WriteLine($"ERROR: {ex}");     // full stack trace, not just the message
+            throw;
+        }
+        finally
+        {
+            Console.WriteLine($"════════ Run ended {DateTime.Now:HH:mm:ss} ════════");
+            tee.Flush();
+            fileWriter.Dispose();
         }
     }
 
@@ -303,13 +343,30 @@ internal static class Program
         while (ComRetry(() => xl.CalculationState) != Excel.XlCalculationState.xlDone)
             Thread.Sleep(500);
     }
+    private static bool RunStep(string name, Action work)
+    {
+        Console.WriteLine($"──── {name} ────");
+        try
+        {
+            work();
+            Console.WriteLine($"──── {name}: OK ────");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"──── {name}: FAILED ────");
+            Console.WriteLine(ex.ToString());                       // full stack trace to the log
+            Failures.Add($"{name}: {ex.GetBaseException().Message}");
+            return false;
+        }
+    }
 
     private static void RunOnSta(Action work)
     {
         Exception err = null;
         var t = new Thread(() =>
         {
-            ExcelMessageFilter.Register();      // your existing class
+            ExcelMessageFilter.Register();
             try { work(); }
             catch (Exception ex) { err = ex; }
             finally { ExcelMessageFilter.Revoke(); }
@@ -317,7 +374,7 @@ internal static class Program
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
         t.Join();
-        if (err != null) throw new Exception(err.Message, err);
+        if (err != null) throw new Exception($"{work.Method.Name} failed: {err.Message}", err);
     }
 
     static string DescribeLock(string path)
