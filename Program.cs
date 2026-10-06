@@ -40,7 +40,7 @@ internal static class Program
         try
         {
             //TD Portal automation to download the report CSV directly
-            RunTDPortalAutomation().GetAwaiter().GetResult();
+            //RunTDPortalAutomation().GetAwaiter().GetResult();
 
             //Saving all daily ACE transaction to Rev Report
             //GetDailyRevenueACETransactions(args);
@@ -49,7 +49,7 @@ internal static class Program
             //CIBC Portal automation to download the report CSV directly
             //RunCIBCPortalAutomation().GetAwaiter().GetResult();
 
-            //RunOnSta(RunCmhc);
+            RunOnSta(RunCmhc);
 
             //RunOnSta(ApplyManualAdjustments);
 
@@ -68,6 +68,11 @@ internal static class Program
 
     private static void RunCmhc()
     {
+        string Code(string s)
+        {
+            var m = Regex.Match(s ?? "", @"\(([^()]+)\)\s*$");
+            return m.Success ? m.Groups[1].Value.Trim().ToLowerInvariant() : "";
+        }
         var today = DateTime.Today;
         var monthName = today.ToString("MMMM", CultureInfo.InvariantCulture);
         var cmhcDir = Path.Combine(@"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\CMHC", monthName);
@@ -134,26 +139,22 @@ internal static class Program
             while (csv.Read())
             {
                 line++;
-                if (line < 3) continue;
-                if (line == 3)
-                {
-                    Console.WriteLine($"  Headers → L='{F(ColDate)}'  O='{F(ColAmt)}'  T='{F(ColName)}'");
-                    continue;
-                }
+                if (line <= 2) continue;                       // 1 = metadata, 2 = headers
 
                 bool isTotal = Enumerable.Range(0, csv.Parser.Count)
                     .Any(i => F(i).StartsWith("Total", StringComparison.OrdinalIgnoreCase));
-                if (isTotal) { Console.WriteLine($"  Row {line}: Total row — skipped"); continue; }
+                if (isTotal) { Console.WriteLine($"  Line {line}: Total row - skipped"); continue; }
 
                 if (!TryDate(F(ColDate), out var d) || d.Date != today) continue;
 
                 var name = F(ColName);
-                if (name.Length == 0) { Console.WriteLine($"  Row {line}: no name in T — skipped"); continue; }
-                if (!TryMoney(F(ColAmt), out var amt)) { Console.WriteLine($"  Row {line}: bad amount '{F(ColAmt)}' — skipped"); continue; }
+                var key = Code(name);
+                if (key.Length == 0) { Console.WriteLine($"  Line {line}: no (code) in '{name}' - skipped"); continue; }
 
-                var key = Norm(name);
+                if (!TryMoney(F(ColAmt), out var amt)) { Console.WriteLine($"  Line {line}: bad amount '{F(ColAmt)}' - skipped"); continue; }
+
                 totals[key] = totals.TryGetValue(key, out var t) ? (t.display, t.amt + amt, t.rows + 1) : (name, amt, 1);
-                Console.WriteLine($"  Row {line}: {name} {amt:F2}");
+                Console.WriteLine($"  Line {line}: {d:yyyy-MM-dd} {name} {amt:F2}");
             }
         }
 
@@ -213,7 +214,12 @@ internal static class Program
             foreach (var r in cmhcRows)
             {
                 var desk = Convert.ToString(((Excel.Range)tim.Cells[r, NameCol]).Value2) ?? "";
-                var key = Norm(desk);
+                var key = Code(desk);
+                if (key.Length == 0)
+                {
+                    Console.WriteLine($"  D{r} '{desk}': no (code) in brackets — can't match");
+                    continue;
+                }
                 if (!totals.TryGetValue(key, out var t))
                 {
                     Console.WriteLine($"  D{r} '{desk}': no CMHC amount today");
@@ -281,7 +287,6 @@ internal static class Program
         try { File.Delete(revLocal); } catch { }
         Console.WriteLine("CMHC complete.");
     }
-
     static T ComRetry<T>(Func<T> call, int timeoutSec = 300)
     {
         var sw = Stopwatch.StartNew();
