@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Excel = Microsoft.Office.Interop.Excel;
 using Path = System.IO.Path;
@@ -59,6 +60,19 @@ internal static class Program
 
         Console.WriteLine($"════════ Run started {DateTime.Now:yyyy-MM-dd HH:mm:ss} — log: {logPath} ════════");
 
+        foreach (var p in Process.GetProcessesByName("EXCEL"))
+        {
+            if (p.MainWindowHandle == IntPtr.Zero)      // hidden = automation leftover; your visible Excel is untouched
+            {
+                try { p.Kill(); Console.WriteLine($"  Killed leftover hidden Excel (PID {p.Id})."); } catch { }
+            }
+        }
+
+        var holidays = (config["Holidays"] ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => DateTime.ParseExact(s, "yyyy-MM-dd", CultureInfo.InvariantCulture).Date)
+            .ToHashSet();
+
         try
         {
             //TD Portal automation to download the report CSV directly
@@ -75,7 +89,7 @@ internal static class Program
             //}
 
             //RunStep("CMHC", () => RunOnSta(RunCmhc));
-            ////RunStep("Manual Adjustments", () => RunOnSta(ApplyManualAdjustments));
+            //RunStep("Manual Adjustments", () => RunOnSta(ApplyManualAdjustments));
 
             //// ── summary at the end, so failures aren't buried mid-log ──
             //if (Failures.Count == 0)
@@ -86,6 +100,11 @@ internal static class Program
             //    foreach (var f in Failures) Console.WriteLine($"  - {f}");
             //    Environment.ExitCode = 1;     // Task Scheduler shows the run as failed
             //}
+
+            //RunStep("Weekend/holiday → next business day", () =>
+            //RunOnSta(() => MoveWeekendToNextBusinessDay(
+            //    LoadOntarioHolidays(DateTime.Today.Year, config),
+            //    dryRun: false)));
 
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
@@ -104,6 +123,29 @@ internal static class Program
             tee.Flush();
             fileWriter.Dispose();
         }
+    }
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+    private static int GetExcelPid(Excel.Application xl)
+    {
+        GetWindowThreadProcessId(new IntPtr(xl.Hwnd), out var pid);
+        return pid;
+    }
+
+    private static void ForceCloseExcel(Excel.Application xl, int pid)
+    {
+        try { xl?.Quit(); } catch { }
+        try { if (xl != null) Marshal.ReleaseComObject(xl); } catch { }
+        GC.Collect(); GC.WaitForPendingFinalizers();
+        GC.Collect(); GC.WaitForPendingFinalizers();
+        try
+        {
+            var p = Process.GetProcessById(pid);
+            if (!p.WaitForExit(5000)) { p.Kill(); Console.WriteLine($"  Excel (PID {pid}) didn't quit — killed."); }
+        }
+        catch (ArgumentException) { /* already gone — good */ }
     }
 
     private static void RunCmhc()
@@ -338,6 +380,230 @@ internal static class Program
         }
     }
 
+    private static HashSet<DateTime> LoadOntarioHolidays(int year, IConfiguration config)
+    {
+        var cacheDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\Holidays";
+        var cachePath = Path.Combine(cacheDir, $"ON_{year}.json");
+        string json;
+
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            json = http.GetStringAsync($"https://canada-holidays.ca/api/v1/provinces/ON?year={year}")
+                       .GetAwaiter().GetResult();
+            Directory.CreateDirectory(cacheDir);
+            File.WriteAllText(cachePath, json);
+            Console.WriteLine($"  Holidays: downloaded Ontario {year}");
+        }
+        catch (Exception ex)
+        {
+            if (!File.Exists(cachePath))
+                throw new InvalidOperationException(
+                    $"Could not download Ontario holidays for {year} and no cached copy exists ({ex.Message}). Not moving anything — a wrong holiday list would put money in the wrong day.", ex);
+            json = File.ReadAllText(cachePath);
+            Console.WriteLine($"  Holidays: download failed ({ex.Message}) — using cached {cachePath}");
+        }
+
+        var set = new HashSet<DateTime>();
+        using (var doc = JsonDocument.Parse(json))
+        {
+            var root = doc.RootElement;
+            var list = root.TryGetProperty("province", out var prov) ? prov.GetProperty("holidays")
+                                                                     : root.GetProperty("holidays");
+            foreach (var h in list.EnumerateArray())
+            {
+                // observedDate = the weekday it's actually taken (e.g. Boxing Day on a Saturday → Monday)
+                var ds = h.TryGetProperty("observedDate", out var od) && od.ValueKind == JsonValueKind.String
+                         ? od.GetString() : h.GetProperty("date").GetString();
+                var d = DateTime.ParseExact(ds!, "yyyy-MM-dd", CultureInfo.InvariantCulture).Date;
+                set.Add(d);
+                Console.WriteLine($"    {d:ddd MMM d}  {h.GetProperty("nameEn").GetString()}");
+            }
+        }
+
+        // company-specific adjustments (optional, both can be left empty)
+        IEnumerable<DateTime> Dates(string key) => (config[key] ?? "")
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => DateTime.ParseExact(s, "yyyy-MM-dd", CultureInfo.InvariantCulture).Date);
+
+        foreach (var d in Dates("ExtraHolidays")) { set.Add(d); Console.WriteLine($"    + {d:ddd MMM d} (company extra)"); }
+        foreach (var d in Dates("NotHolidays")) { set.Remove(d); Console.WriteLine($"    - {d:ddd MMM d} (office open)"); }
+
+        return set;
+    }
+    private static void MoveWeekendToNextBusinessDay(HashSet<DateTime> holidays, bool dryRun = false)
+    {
+        var today = DateTime.Today;
+        var tabs = new[] { "Tim Katis", "Barb Boudreau", "Ian Tougas", "Frank Ramlal", "HOUSE" };
+        const int DayStartCol = 9, DayEndCol = 41;          // I..AO
+        const int NameCol = 2, DeskCol = 4;                 // B, D
+
+        bool IsBiz(DateTime d) =>
+            d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday && !holidays.Contains(d.Date);
+
+        Console.WriteLine("═══════════════════════════════════════════");
+        Console.WriteLine($"  Weekend/holiday → next business day {(dryRun ? "(DRY RUN — nothing saved)" : "")}");
+        Console.WriteLine($"  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine("═══════════════════════════════════════════");
+
+        if (!IsBiz(today))
+        {
+            Console.WriteLine($"  Today ({today:ddd MMM d}) is not a business day — nothing to do.");
+            return;
+        }
+
+        // every non-business day this month before today → its next business day
+        var moves = new List<(DateTime from, DateTime to)>();
+        for (var d = new DateTime(today.Year, today.Month, 1); d < today; d = d.AddDays(1))
+        {
+            if (IsBiz(d)) continue;
+            var to = d.AddDays(1);
+            while (!IsBiz(to)) to = to.AddDays(1);
+            moves.Add((d, to));
+        }
+
+        // weekend at the end of LAST month lands in this month → it lives in last month's file, not handled here
+        var prev = today.AddDays(-1);
+        if (prev.Month != today.Month && !IsBiz(prev))
+            Console.WriteLine($"  NOTE: {prev:ddd MMM d} is in last month's Rev Report — not moved by this step.");
+
+        if (moves.Count == 0)
+        {
+            Console.WriteLine("  No weekend/holiday days so far this month — nothing to do.");
+            return;
+        }
+        foreach (var m in moves) Console.WriteLine($"  Plan: {m.from:ddd MMM d} → {m.to:ddd MMM d}");
+
+        var revDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+        var revPath = FindRevReport(revDir, today, mustContain: "V8");
+        Console.WriteLine($"  Rev Report: {revPath}");
+
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
+        int movedCells = 0; double movedTotal = 0;
+        xl = new Excel.Application
+        {
+            Visible = false,
+            DisplayAlerts = false,
+            AskToUpdateLinks = false,
+            ScreenUpdating = false,
+            EnableEvents = false
+        };
+        int excelPid = GetExcelPid(xl);
+        try
+        { 
+            wb = ComRetry(() => xl.Workbooks.Open(revPath, UpdateLinks: 0, ReadOnly: false));
+            WaitForExcelIdle(xl);
+            if (wb.ReadOnly)
+                throw new InvalidOperationException($"{Path.GetFileName(revPath)} opened READ-ONLY — someone has it open.");
+
+            foreach (var tabName in tabs)
+            {
+                int skippedFormula = 0, skippedText = 0, movedPivot = 0;
+                Excel.Worksheet ws = null;
+                foreach (Excel.Worksheet w in wb.Worksheets)
+                    if (w.Name.Trim().Equals(tabName, StringComparison.OrdinalIgnoreCase)) { ws = w; break; }
+                if (ws == null) { Console.WriteLine($"  WARNING: tab '{tabName}' not found — skipped."); continue; }
+
+                // day number → column, from row 1
+                var dayToCol = new Dictionary<int, int>();
+                var hdr = (object[,])ws.Range[ws.Cells[1, DayStartCol], ws.Cells[1, DayEndCol]].Value2;
+                for (int c = 1; c <= hdr.GetLength(1); c++)
+                    if (hdr[1, c] is double h)
+                    {
+                        int day = h < 32 ? (int)h : DateTime.FromOADate(h).Day;
+                        if (day >= 1 && day <= 31 && !dayToCol.ContainsKey(day)) dayToCol[day] = DayStartCol + c - 1;
+                    }
+
+                // last row with a name (B) or desk (D)
+                int lastRow = Math.Max(
+                    ((Excel.Range)ws.Cells[ws.Rows.Count, NameCol]).End[Excel.XlDirection.xlUp].Row,
+                    ((Excel.Range)ws.Cells[ws.Rows.Count, DeskCol]).End[Excel.XlDirection.xlUp].Row);
+                if (lastRow < 3) { Console.WriteLine($"  {tabName}: no data rows — skipped."); continue; }
+
+                var names = (object[,])ws.Range[ws.Cells[2, NameCol], ws.Cells[lastRow, NameCol]].Value2;
+                var desks = (object[,])ws.Range[ws.Cells[2, DeskCol], ws.Cells[lastRow, DeskCol]].Value2;
+                Console.WriteLine($"\n  {tabName}: rows 2–{lastRow}");
+
+                foreach (var (from, to) in moves)
+                {
+                    
+                    if (!dayToCol.TryGetValue(from.Day, out var fCol) || !dayToCol.TryGetValue(to.Day, out var tCol))
+                    { Console.WriteLine($"    WARNING: day {from.Day} or {to.Day} column not found — skipped."); continue; }
+
+                    var srcRange = ws.Range[ws.Cells[2, fCol], ws.Cells[lastRow, fCol]];
+                    var srcForm = (object[,])srcRange.Formula;
+                    var srcVal = (object[,])srcRange.Value2;
+
+                    for (int i = 1; i <= lastRow - 1; i++)
+                    {
+                        int r = i + 1;
+                        var name = Convert.ToString(names[i, 1])?.Trim();
+                        var desk = Convert.ToString(desks[i, 1])?.Trim();
+                        if (string.IsNullOrEmpty(name) && string.IsNullOrEmpty(desk)) continue;   // not a table row
+
+                        var srcF = Convert.ToString(srcForm[i, 1]) ?? "";
+                        bool isFormula = srcF.StartsWith("=");
+                        bool isPivot = isFormula && srcF.IndexOf("GETPIVOTDATA", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                        if (isFormula && !isPivot) { skippedFormula++; continue; }   // SUM / total rows recalc themselves
+
+                        double amt = srcVal[i, 1] is double dv ? dv : 0;
+                        if (!isPivot && Math.Abs(amt) < 0.005) continue;             // empty typed cell — nothing to move
+
+                        var tCell = (Excel.Range)ws.Cells[r, tCol];
+                        string tF = tCell.HasFormula is bool hf && hf ? (string)tCell.Formula : null;
+                        double tOld = tCell.Value2 is double tv ? tv : 0;
+
+                        // what gets added to the target: the source formula itself (live) or the typed number
+                        string addPart = isPivot
+                            ? $"({srcF.Substring(1)})"
+                            : Math.Abs(amt).ToString("0.00", CultureInfo.InvariantCulture);
+                        string sign = (!isPivot && amt < 0) ? "-" : "+";
+
+                        string newTarget = tF != null
+                            ? $"{tF}{sign}{addPart}"
+                            : $"={tOld.ToString("0.00", CultureInfo.InvariantCulture)}{sign}{addPart}";
+
+                        if (!dryRun)
+                        {
+                            tCell.Formula = newTarget;
+                            ((Excel.Range)ws.Cells[r, fCol]).Value2 = 0;
+                        }
+
+                        movedCells++;
+                        if (isPivot) movedPivot++;
+                        movedTotal += amt;
+
+                        // log only rows that actually carry money, otherwise the log gets huge
+                        if (Math.Abs(amt) >= 0.005)
+                            Console.WriteLine($"    r{r,-4} {(name ?? desk),-30} {from:MMM d} {amt,10:F2} → {to:MMM d}{(isPivot ? "  (pivot formula moved)" : "")}");
+                    }
+                }
+                Console.WriteLine($"    {tabName}: {movedPivot} pivot formula(s) moved, {skippedFormula} total/SUM formula(s) left alone");
+            }
+            
+            Console.WriteLine($"\n  Moved {movedCells} cell(s), total {movedTotal:F2}.");
+
+            if (!dryRun && movedCells > 0)
+            {
+                xl.CalculateFull();
+                WaitForExcelIdle(xl);
+                wb.Save();
+                Console.WriteLine("  Saved.");
+            }
+            else Console.WriteLine(dryRun ? "  DRY RUN — workbook NOT saved." : "  Nothing moved — workbook not saved.");
+
+            wb.Close(false); wb = null;
+        }
+        finally
+        {
+            if (wb != null) wb.Close(false);
+            if (xl != null) { xl.Quit(); Marshal.ReleaseComObject(xl); }
+            GC.Collect(); GC.WaitForPendingFinalizers();
+            ForceCloseExcel(xl, excelPid);
+        }
+    }
     static void WaitForExcelIdle(Excel.Application xl)
     {
         while (ComRetry(() => xl.CalculationState) != Excel.XlCalculationState.xlDone)
@@ -768,8 +1034,8 @@ internal static class Program
     {
         const string TD_SHEET = "TD DATA";
         const string DEST_SHEET = "Tim Katis";
-        const int DEST_TOTAL_ROW = 182;
-        const int DEST_FIRST_ROW = 183;
+        const int DEST_TOTAL_ROW = 181;
+        const int DEST_FIRST_ROW = 182;
         const int DEST_LAST_ROW = 200;
         const int DEST_CODE_COL = 4;   // D
         const int DEST_VALUE_COL = 5;   // E
