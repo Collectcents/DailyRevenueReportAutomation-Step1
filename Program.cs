@@ -15,7 +15,6 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Excel = Microsoft.Office.Interop.Excel;
 using Path = System.IO.Path;
-using Table = DocumentFormat.OpenXml.Spreadsheet.Table;
 
 namespace DailyRevenueReportAutomation;
 
@@ -77,7 +76,7 @@ internal static class Program
         {
             //TD Portal automation to download the report CSV directly
             //RunStep("TD portal + Rev Report", () => RunTDPortalAutomation().GetAwaiter().GetResult());
-            //RunStep("ACE transactions → Trans tab", () => GetDailyRevenueACETransactions(args));
+            RunStep("ACE transactions → Trans tab", () => RunOnSta(GetDailyRevenueACETransactions));
 
             //bool cibcDownloaded = RunStep("CIBC portal download", () => RunCIBCPortalAutomation().GetAwaiter().GetResult());
             //if (cibcDownloaded)
@@ -109,6 +108,22 @@ internal static class Program
             //Performance Report automation Agency 2 & 4
             //RunPerformanceReportAutomation().GetAwaiter().GetResult();
 
+            // usage:  DailyRevenueReportAutomation.exe --reset-month 2026-11            (dry run)
+            //         DailyRevenueReportAutomation.exe --reset-month 2026-11 --live     (for real)
+            //var resetAt = Array.IndexOf(args, "--reset-month");
+            //if (resetAt >= 0)
+            //{
+            //    var month = DateTime.ParseExact(args[resetAt + 1], "yyyy-MM", CultureInfo.InvariantCulture);
+            //    bool live = args.Contains("--live");
+            //    RunStep($"New month {month:MMMM yyyy}", () =>
+            //        RunOnSta(() => ResetRevReportForNewMonth(
+            //            month,
+            //            LoadOntarioHolidays(month.Year, config),
+            //            dryRun: !live,
+            //            mustContain: "V8")));      // "V8" for the real files
+            //    return;
+            //}
+
             Console.WriteLine("Done.");
             //return 0;
         }
@@ -123,6 +138,320 @@ internal static class Program
             tee.Flush();
             fileWriter.Dispose();
         }
+    }
+
+    private static void ResetRevReportForNewMonth(DateTime targetMonth, HashSet<DateTime> holidays,
+                                              bool dryRun = true, string mustContain = "V8")
+    {
+        var tabs = new[] { "Tim Katis", "Barb Boudreau", "Ian Tougas", "Frank Ramlal", "HOUSE" };
+        const int FirstDayCol = 9, LastDayCol = 39;
+        const int NameCol = 2, DeskCol = 4;
+        const int TkClearFrom = 117, TkClearTo = 203;
+        const int TkExtraFrom = 205, TkExtraTo = 235;
+        int nDays = LastDayCol - FirstDayCol + 1;
+
+        var first = new DateTime(targetMonth.Year, targetMonth.Month, 1);
+        var prevMonth = first.AddMonths(-1);
+
+        Console.WriteLine("═══════════════════════════════════════════");
+        Console.WriteLine($"  NEW MONTH {first:MMMM yyyy} from {prevMonth:MMMM yyyy} {(dryRun ? "(DRY RUN — nothing created or saved)" : "(LIVE)")}");
+        Console.WriteLine("═══════════════════════════════════════════");
+
+        var revDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
+        var srcPath = FindRevReport(revDir, prevMonth, mustContain);
+
+        // "Rev Report SEPTEMBER 2026 V8.xlsx" → "Rev Report OCTOBER 2026 V8.xlsx"
+        var srcName = Path.GetFileName(srcPath);
+        var newName = Regex.Replace(srcName,
+            prevMonth.ToString("MMMM", CultureInfo.InvariantCulture),
+            first.ToString("MMMM", CultureInfo.InvariantCulture).ToUpperInvariant(),
+            RegexOptions.IgnoreCase);
+        newName = newName.Replace(prevMonth.Year.ToString(), first.Year.ToString());
+        var newPath = Path.Combine(revDir, newName);
+
+        Console.WriteLine($"  Source (kept as is): {srcName}");
+        Console.WriteLine($"  New file:            {newName}");
+
+        if (string.Equals(srcName, newName, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Couldn't build a new file name from '{srcName}' — month name not found in it.");
+        if (File.Exists(newPath))
+            throw new InvalidOperationException($"{newName} already exists — refusing to overwrite it. Delete or rename it first if you really want to recreate it.");
+
+        string workPath;
+        if (dryRun)
+            workPath = srcPath;                                  // inspected read-only, never saved
+        else
+        {
+            File.Copy(srcPath, newPath);
+            workPath = newPath;
+            Console.WriteLine($"  Created {newName} — resetting it now.");
+        }
+
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
+        int excelPid = 0;
+        try
+        {
+            xl = new Excel.Application
+            {
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
+            excelPid = GetExcelPid(xl);
+            wb = ComRetry(() => xl.Workbooks.Open(workPath, UpdateLinks: 0, ReadOnly: dryRun));
+            WaitForExcelIdle(xl);
+            if (!dryRun && wb.ReadOnly)
+                throw new InvalidOperationException($"{newName} opened READ-ONLY — someone has it open.");
+
+            xl.Calculation = Excel.XlCalculation.xlCalculationManual;   // fast bulk writes
+
+            Excel.Worksheet Ws(string name)
+            {
+                foreach (Excel.Worksheet w in wb.Worksheets)
+                    if (w.Name.Trim().Equals(name, StringComparison.OrdinalIgnoreCase)) return w;
+                throw new InvalidOperationException($"Tab '{name}' not found.");
+            }
+
+            // ── 1. Trans: delete all transactions, keep header/table ──
+            var trans = Ws("Trans");
+            if (trans.ListObjects.Count > 0)
+            {
+                var lo = trans.ListObjects[1];
+                Console.WriteLine($"  Trans: {lo.ListRows.Count} row(s) to delete (table '{lo.Name}')");
+                if (!dryRun && lo.DataBodyRange != null) lo.DataBodyRange.Delete();
+            }
+            else
+            {
+                int tLast = trans.UsedRange.Row + trans.UsedRange.Rows.Count - 1;
+                Console.WriteLine($"  Trans: rows 2–{tLast} to delete (no table found)");
+                if (!dryRun && tLast >= 2) trans.Range[$"A2:A{tLast}"].EntireRow.Delete();
+            }
+
+            // ── 1b. TD DATA: clear last month's pasted block (H2:M) ──
+            var tdData = Ws("TD DATA");
+            int tdLast = ((Excel.Range)tdData.Cells[tdData.Rows.Count, 8]).End[Excel.XlDirection.xlUp].Row;
+            Console.WriteLine(tdLast >= 2 ? $"  TD DATA: clearing H2:M{tdLast}" : "  TD DATA: already empty");
+            if (!dryRun && tdLast >= 2) tdData.Range[$"H2:M{tdLast}"].ClearContents();
+
+            // ── 2. Manual Adjustments: clear B3:G<last> ──
+            var man = Ws("Manual Adjustments");
+            int manLast = 2;
+            for (int c = 2; c <= 7; c++)
+                manLast = Math.Max(manLast, ((Excel.Range)man.Cells[man.Rows.Count, c]).End[Excel.XlDirection.xlUp].Row);
+            Console.WriteLine(manLast >= 3 ? $"  Manual Adjustments: clearing B3:G{manLast}" : "  Manual Adjustments: already empty");
+            if (!dryRun && manLast >= 3) man.Range[$"B3:G{manLast}"].ClearContents();
+
+            // ── 3. Tim Katis: clear I117:AM203 ──
+            var tk = Ws("Tim Katis");
+            Console.WriteLine($"  Tim Katis: clearing I{TkClearFrom}:AM{TkClearTo}");
+            if (!dryRun) tk.Range[tk.Cells[TkClearFrom, FirstDayCol], tk.Cells[TkClearTo, LastDayCol]].ClearContents();
+
+            // ── 4. Reset day formulas on all 5 tabs ──
+            foreach (var tab in tabs)
+            {
+                var ws = Ws(tab);
+                bool isTk = tab.Equals("Tim Katis", StringComparison.OrdinalIgnoreCase);
+
+                int lastRow = Math.Max(
+                    ((Excel.Range)ws.Cells[ws.Rows.Count, NameCol]).End[Excel.XlDirection.xlUp].Row,
+                    ((Excel.Range)ws.Cells[ws.Rows.Count, DeskCol]).End[Excel.XlDirection.xlUp].Row);
+                if (isTk) lastRow = Math.Max(lastRow, TkExtraTo);
+                if (lastRow < 3) { Console.WriteLine($"  {tab}: no rows — skipped"); continue; }
+
+                var names = (object[,])ws.Range[ws.Cells[2, NameCol], ws.Cells[lastRow, NameCol]].Value2;
+                var desks = (object[,])ws.Range[ws.Cells[2, DeskCol], ws.Cells[lastRow, DeskCol]].Value2;
+                var block = (object[,])ws.Range[ws.Cells[2, FirstDayCol], ws.Cells[lastRow, LastDayCol]].FormulaR1C1;
+
+                var resetIdx = new List<int>();
+                int cleaned = 0, noTemplate = 0;
+
+                for (int i = 1; i <= lastRow - 1; i++)
+                {
+                    int r = i + 1;
+                    if (isTk && r >= TkClearFrom && r <= TkClearTo) continue;
+
+                    bool hasLabel = !string.IsNullOrWhiteSpace(Convert.ToString(names[i, 1]))
+                                 || !string.IsNullOrWhiteSpace(Convert.ToString(desks[i, 1]));
+                    bool tkExtra = isTk && r >= TkExtraFrom && r <= TkExtraTo;
+                    if (!hasLabel && !tkExtra) continue;        // ranking lists etc. — untouched
+
+                    // template = first day column holding a formula with at most one pivot lookup
+                    string template = null; int templDay = 0;
+                    for (int c = 1; c <= nDays; c++)
+                    {
+                        var f = Convert.ToString(block[i, c]) ?? "";
+                        if (!f.StartsWith("=")) continue;
+                        if (Regex.Matches(f, "GETPIVOTDATA", RegexOptions.IgnoreCase).Count > 1) continue;  // a Monday with weekend add-ons
+                        template = f; templDay = c; break;
+                    }
+                    if (template == null)
+                    {
+                        bool anyContent = Enumerable.Range(1, nDays).Any(c => !string.IsNullOrEmpty(Convert.ToString(block[i, c])));
+                        if (anyContent) { noTemplate++; Console.WriteLine($"    r{r}: no usable formula in I:AM — left as is"); }
+                        continue;
+                    }
+
+                    var clean = CleanFormula(template);
+                    if (templDay != 1) Console.WriteLine($"    r{r}: day 1 not usable — template taken from day {templDay}");
+                    if (clean != template)
+                    {
+                        cleaned++;
+                        Console.WriteLine($"    r{r} {Convert.ToString(names[i, 1]) ?? Convert.ToString(desks[i, 1])}:");
+                        Console.WriteLine($"        before: {ToA1(xl, template, (Excel.Range)ws.Cells[r, FirstDayCol])}");
+                        Console.WriteLine($"        after : {ToA1(xl, clean, (Excel.Range)ws.Cells[r, FirstDayCol])}");
+                    }
+
+                    for (int c = 1; c <= nDays; c++) block[i, c] = clean;
+                    resetIdx.Add(i);
+                }
+
+                // write back only the reset rows, in contiguous runs (formulas only, no formatting)
+                if (!dryRun)
+                    foreach (var (s, e) in ContiguousRuns(resetIdx))
+                    {
+                        var sub = new object[e - s + 1, nDays];
+                        for (int i = s; i <= e; i++)
+                            for (int c = 1; c <= nDays; c++)
+                                sub[i - s, c - 1] = block[i, c];
+                        ws.Range[ws.Cells[s + 1, FirstDayCol], ws.Cells[e + 1, LastDayCol]].FormulaR1C1 = sub;
+                    }
+
+                Console.WriteLine($"  {tab}: {resetIdx.Count} row(s) reset across days 1–31, {cleaned} cleaned, {noTemplate} without a formula");
+            }
+
+            // ── 4b. SUMMARY!F3 = first day of the new month ──
+            var summary = Ws("SUMMARY");
+            Console.WriteLine($"  SUMMARY!F3: {summary.Range["F3"].Text} → {first:M/d/yyyy}");
+            if (!dryRun) summary.Range["F3"].Value2 = first.ToOADate();     // keeps the cell's date format
+
+            // ── 4c. SUMMARY!AN3 = public holidays on weekdays this month ──
+            var monthHolidays = holidays
+                .Where(d => d.Year == first.Year && d.Month == first.Month
+                         && d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday)
+                .OrderBy(d => d).ToList();
+            Console.WriteLine($"  SUMMARY!AN3: {summary.Range["AN3"].Text} → {monthHolidays.Count}" +
+                (monthHolidays.Count > 0 ? $"  ({string.Join(", ", monthHolidays.Select(d => d.ToString("ddd MMM d")))})" : ""));
+            if (!dryRun) summary.Range["AN3"].Value2 = monthHolidays.Count;
+
+            // ── 4d. Tim Katis TD + CMHC blocks, located by their labels in column D ──
+            const int ScanFrom = 150, ScanTo = 300;
+            var dScan = (object[,])tk.Range[$"D{ScanFrom}:D{ScanTo}"].Value2;
+            string D(int row) => (Convert.ToString(dScan[row - ScanFrom + 1, 1]) ?? "").Trim();
+
+            int FindLabel(string label)
+            {
+                for (int r = ScanFrom; r <= ScanTo; r++)
+                    if (D(r).Equals(label, StringComparison.OrdinalIgnoreCase)) return r;
+                throw new InvalidOperationException($"'{label}' not found in Tim Katis D{ScanFrom}:D{ScanTo}.");
+            }
+
+            int tdTotalRow = FindLabel("TOTAL ON TD");
+            int cmhcTotalRow = FindLabel("TOTAL ON CMHC");
+            Console.WriteLine($"  Tim Katis: TOTAL ON TD = row {tdTotalRow}, TOTAL ON CMHC = row {cmhcTotalRow}");
+
+            void ResetE(int r, bool isTotal)
+            {
+                var e = (Excel.Range)tk.Cells[r, 5];
+                bool isFormula = e.HasFormula is bool f && f;
+                if (isTotal && isFormula)
+                {
+                    Console.WriteLine($"    E{r} ({D(r)}) total formula kept: {e.Formula}");
+                    return;
+                }
+                Console.WriteLine($"    E{r} ({D(r)}): was {(isFormula ? e.Formula : e.Value2)} → 0");
+                if (!dryRun) e.Value2 = 0;
+            }
+
+            // TD: TOTAL ON TD row + agent rows, up to (not including) TOTAL ON CMHC
+            for (int r = tdTotalRow; r < cmhcTotalRow; r++)
+                ResetE(r, isTotal: r == tdTotalRow);
+
+            // CMHC: TOTAL ON CMHC row + rows below it that have a (code)
+            ResetE(cmhcTotalRow, isTotal: true);
+            for (int r = cmhcTotalRow + 1; r <= ScanTo && Regex.IsMatch(D(r), @"\([^()]+\)\s*$"); r++)
+                ResetE(r, isTotal: false);
+            // the two TOTAL rows themselves are never touched
+
+            // ── 5. Refresh pivots, recalc, save ──
+            if (!dryRun)
+            {
+                try { foreach (Excel.PivotCache pc in wb.PivotCaches()) pc.Refresh(); }
+                catch (Exception ex) { Console.WriteLine($"  Pivot refresh warning: {ex.Message}"); }
+
+                xl.Calculation = Excel.XlCalculation.xlCalculationAutomatic;
+                xl.CalculateFull();
+                WaitForExcelIdle(xl);
+                wb.Save();
+                Console.WriteLine("  Saved.");
+            }
+            else Console.WriteLine("  DRY RUN — workbook NOT saved.");
+
+            wb.Close(false); wb = null;
+        }
+        finally
+        {
+            if (wb != null) try { wb.Close(false); } catch { }
+            ForceCloseExcel(xl, excelPid);
+        }
+    }
+
+    // strip trailing +/- numbers and redundant outer brackets, repeatedly
+    private static string CleanFormula(string f)
+    {
+        if (string.IsNullOrEmpty(f) || !f.StartsWith("=")) return f;
+        var body = f.Substring(1).Trim();
+        var trailingNum = new Regex(@"\s*[+\-]\s*\(?\s*-?\d+(?:\.\d+)?\s*\)?\s*$");
+        string prev;
+        do
+        {
+            prev = body;
+            body = trailingNum.Replace(body, "");
+            body = UnwrapOuterParens(body);
+        } while (body != prev);
+        return "=" + body;
+    }
+
+    private static string UnwrapOuterParens(string s)
+    {
+        s = s.Trim();
+        while (s.Length >= 2 && s[0] == '(' && s[^1] == ')' && MatchingParen(s, 0) == s.Length - 1)
+            s = s.Substring(1, s.Length - 2).Trim();
+        return s;
+    }
+
+    private static int MatchingParen(string s, int open)
+    {
+        int depth = 0; bool inStr = false;
+        for (int i = open; i < s.Length; i++)
+        {
+            char c = s[i];
+            if (c == '"') inStr = !inStr;
+            if (inStr) continue;
+            if (c == '(') depth++;
+            else if (c == ')' && --depth == 0) return i;
+        }
+        return -1;
+    }
+
+    private static IEnumerable<(int start, int end)> ContiguousRuns(List<int> idx)
+    {
+        for (int k = 0; k < idx.Count;)
+        {
+            int s = idx[k], e = s;
+            while (k + 1 < idx.Count && idx[k + 1] == e + 1) { k++; e++; }
+            yield return (s, e);
+            k++;
+        }
+    }
+
+    // readable A1 version of an R1C1 formula for the log
+    private static string ToA1(Excel.Application xl, string r1c1, Excel.Range relativeTo)
+    {
+        try { return Convert.ToString(xl.ConvertFormula(r1c1, Excel.XlReferenceStyle.xlR1C1, Excel.XlReferenceStyle.xlA1, Type.Missing, relativeTo)); }
+        catch { return r1c1; }   // ConvertFormula has a 255-char limit
     }
 
     [DllImport("user32.dll")]
@@ -160,7 +489,7 @@ internal static class Program
         var cmhcDir = Path.Combine(@"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report\Rev Report Others\CMHC", monthName);
         var revDir = @"\\fro-vfs-01\Shared\Reporting\SDriveDown\Rev Report";
 
-        int[] cmhcRows = { 202, 203 };            // Tim Katis rows to check
+        //int[] cmhcRows = { 202, 203 };            // Tim Katis rows to check
         const int NameCol = 4;                    // D
         const int FormulaCol = 5;                 // E
         const int DayStartCol = 9, DayEndCol = 41;// I..AO
@@ -290,29 +619,84 @@ internal static class Program
             if (dayCol == -1) throw new InvalidOperationException($"Day {today.Day} not found in Tim Katis row 1.");
             Console.WriteLine($"  Day {today.Day} → column {dayCol}");
 
-            // ── 4. Match D202/D203 and post ──
-            var handled = new HashSet<string>();
-            int changes = 0;
-            foreach (var r in cmhcRows)
+            //// ── 4. Match D202/D203 and post ──
+            //var handled = new HashSet<string>();
+            //int changes = 0;
+            //foreach (var r in cmhcRows)
+            //{
+            //    var desk = Convert.ToString(((Excel.Range)tim.Cells[r, NameCol]).Value2) ?? "";
+            //    var key = Code(desk);
+            //    if (key.Length == 0)
+            //    {
+            //        Console.WriteLine($"  D{r} '{desk}': no (code) in brackets — can't match");
+            //        continue;
+            //    }
+            //    if (!totals.TryGetValue(key, out var t))
+            //    {
+            //        Console.WriteLine($"  D{r} '{desk}': no CMHC amount today");
+            //        continue;
+            //    }
+            //    handled.Add(key);
+
+            //    var dayCell = (Excel.Range)tim.Cells[r, dayCol];
+            //    if (dayCell.Value2 is double existing && Math.Abs(existing) > 0.004)
+            //    {
+            //        Console.WriteLine($"  D{r} '{desk}': day cell already {existing:F2} — SKIPPED (already posted? E not changed)");
+            //        continue;
+            //    }
+
+            //    var amtStr = Math.Abs(t.amt).ToString("0.00", CultureInfo.InvariantCulture);
+            //    var sign = t.amt < 0 ? "-" : "+";
+
+            //    dayCell.Value2 = t.amt;
+
+            //    var eCell = (Excel.Range)tim.Cells[r, FormulaCol];
+            //    string before;
+            //    if (eCell.HasFormula is bool hf && hf)
+            //    {
+            //        before = (string)eCell.Formula;
+            //        eCell.Formula = $"{before}{sign}{amtStr}";
+            //    }
+            //    else
+            //    {
+            //        double old = eCell.Value2 is double ev ? ev : 0;
+            //        before = old.ToString("F2", CultureInfo.InvariantCulture);
+            //        eCell.Formula = $"={before}{sign}{amtStr}";
+            //    }
+            //    changes++;
+            //    Console.WriteLine($"  D{r} '{desk}': day cell = {t.amt:F2} | E{r}: {before} → {eCell.Formula}");
+            //}
+
+            //foreach (var kv in totals.Where(kv => !handled.Contains(kv.Key)))
+            //    Console.WriteLine($"  WARNING: '{kv.Value.display}' {kv.Value.amt:F2} matched neither D{string.Join("/D", cmhcRows)} — NOT posted");
+
+            // ── 4. Find CMHC rows by their (code) in column D, then post ──
+            var deskRows = new Dictionary<string, int>();
+            var dScan = (object[,])tim.Range["D170:D260"].Value2;
+            for (int i = 1; i <= dScan.GetLength(0); i++)
             {
-                var desk = Convert.ToString(((Excel.Range)tim.Cells[r, NameCol]).Value2) ?? "";
-                var key = Code(desk);
-                if (key.Length == 0)
+                var code = Code(Convert.ToString(dScan[i, 1]));
+                if (code.Length > 0 && !deskRows.ContainsKey(code))
+                    deskRows[code] = 169 + i;                      // D170 is i = 1
+            }
+            Console.WriteLine($"  CMHC rows found: {string.Join(", ", deskRows.Select(kv => $"{kv.Key}=row {kv.Value}"))}");
+
+            int changes = 0;
+            foreach (var kv in totals)
+            {
+                var key = kv.Key;
+                var t = kv.Value;
+
+                if (!deskRows.TryGetValue(key, out var r))
                 {
-                    Console.WriteLine($"  D{r} '{desk}': no (code) in brackets — can't match");
+                    Console.WriteLine($"  WARNING: '{t.display}' {t.amt:F2} — no row with ({key}) in D170:D260, NOT posted");
                     continue;
                 }
-                if (!totals.TryGetValue(key, out var t))
-                {
-                    Console.WriteLine($"  D{r} '{desk}': no CMHC amount today");
-                    continue;
-                }
-                handled.Add(key);
 
                 var dayCell = (Excel.Range)tim.Cells[r, dayCol];
                 if (dayCell.Value2 is double existing && Math.Abs(existing) > 0.004)
                 {
-                    Console.WriteLine($"  D{r} '{desk}': day cell already {existing:F2} — SKIPPED (already posted? E not changed)");
+                    Console.WriteLine($"  D{r} ({key}): day cell already {existing:F2} — SKIPPED (already posted?)");
                     continue;
                 }
 
@@ -335,11 +719,8 @@ internal static class Program
                     eCell.Formula = $"={before}{sign}{amtStr}";
                 }
                 changes++;
-                Console.WriteLine($"  D{r} '{desk}': day cell = {t.amt:F2} | E{r}: {before} → {eCell.Formula}");
+                Console.WriteLine($"  D{r} ({key}): day cell = {t.amt:F2} | E{r}: {before} → {eCell.Formula}");
             }
-
-            foreach (var kv in totals.Where(kv => !handled.Contains(kv.Key)))
-                Console.WriteLine($"  WARNING: '{kv.Value.display}' {kv.Value.amt:F2} matched neither D{string.Join("/D", cmhcRows)} — NOT posted");
 
             if (changes > 0)
             {
@@ -1036,7 +1417,7 @@ internal static class Program
         const string DEST_SHEET = "Tim Katis";
         const int DEST_TOTAL_ROW = 181;
         const int DEST_FIRST_ROW = 182;
-        const int DEST_LAST_ROW = 200;
+        const int DEST_LAST_ROW = 199;
         const int DEST_CODE_COL = 4;   // D
         const int DEST_VALUE_COL = 5;   // E
         const int DEST_RESULT_COL = 6;   // F
@@ -1761,7 +2142,7 @@ internal static class Program
         public string Tab { get; set; } = "";
     }
 
-    private static void GetDailyRevenueACETransactions(string[] args)
+    private static void GetDailyRevenueACETransactions()
     {
         try
         {
@@ -1784,12 +2165,12 @@ internal static class Program
             Console.WriteLine($"Rev Report: {reportPath}");
 
             var sheetName = config["Report:SheetName"] ?? "Trans";
-            var numCols = int.Parse(config["Report:NumCols"] ?? "18");
-            var dateColIndex = int.Parse(config["Report:DateColIndex"] ?? "7");
-            var dateColName = config["Report:DateColName"] ?? "Transaction_Date";
+
             // ── Parse optional report month arg (YYYY-MM), default = now ──
-            var (year, month) = ParseReportMonth(args);
-            Console.WriteLine($"Filtering to: {new DateTime(year, month, 1):MMMM yyyy}");
+            // ── Use current month ──
+            var today = DateTime.Today;
+            var year = today.Year;
+            var month = today.Month;
 
             // ── 1. Connect to SFTP ────────────────────────────────────────
             Console.WriteLine("Connecting to SFTP...");
@@ -1809,26 +2190,90 @@ internal static class Program
             Console.WriteLine($"CSV loaded: {rows.Count} rows, {headers.Length} columns");
             Console.WriteLine($"Columns: {string.Join(", ", headers)}");
 
-            // ── 5. Resolve date column ────────────────────────────────────
-            var dateIdx = ResolveDateColumnIndex(headers, dateColName, dateColIndex);
-
-            // ── 6. Filter to target month ─────────────────────────────────
-            var filtered = FilterByMonth(rows, dateIdx, year, month);
-            if (filtered.Count == 0)
+            string Get(string[] r, int i) => i < r.Length ? r[i] : "";
+            int Col(string name)
             {
-                Console.WriteLine("No rows to write. Exiting without modifying the report.");
+                int i = Array.FindIndex(headers, h => h.Trim().Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (i < 0) throw new InvalidOperationException($"Column '{name}' not found in CSV.");
+                return i;
+            }
+            int postIdx = Col("Post_Date");
+            int transIdx = Col("Transaction_Date");
+
+            // ── 5. Which business day is it? ──
+            HashSet<DateTime> holidays;
+            try { holidays = LoadOntarioHolidays(today.Year, config); }
+            catch (Exception hx)
+            {
+                Console.WriteLine($"  Holidays unavailable ({hx.Message}) — counting weekends only.");
+                holidays = new HashSet<DateTime>();
+            }
+            bool IsBiz(DateTime d) => d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday && !holidays.Contains(d.Date);
+
+            var monthStart = new DateTime(today.Year, today.Month, 1);
+            var prevMonth = monthStart.AddMonths(-1);
+            var firstBiz = monthStart;
+            while (!IsBiz(firstBiz)) firstBiz = firstBiz.AddDays(1);
+            int bizDay = BusinessDaysSoFar(today, holidays);
+
+            List<string[]> toWrite;
+            DateTime replaceFrom;
+
+            if (bizDay <= 2)
+            {
+                // ── Day 1–2: clear Trans, write everything except last month's Transaction_Date ──
+                replaceFrom = DateTime.MinValue;                  // = remove every existing row
+                toWrite = new List<string[]>();
+                int dropped = 0, unparsed = 0;
+                foreach (var r in rows)
+                {
+                    bool postOk = TryParseTransDate(Get(r, postIdx), out var pd);
+                    bool transOk = TryParseTransDate(Get(r, transIdx), out var td);
+
+                    if (!postOk || !transOk) { unparsed++; toWrite.Add(r); continue; }   // can't tell → keep
+
+                    bool postedDay1 = pd.Date <= firstBiz;                              // 1st business day (incl. any weekend before it)
+                    bool transPrevMon = td.Year == prevMonth.Year && td.Month == prevMonth.Month;
+
+                    if (postedDay1 && transPrevMon) { dropped++; continue; }
+                    toWrite.Add(r);
+                }
+                Console.WriteLine($"Business day {bizDay}: clearing Trans. {rows.Count} rows in file, " +
+                              $"{dropped} dropped (posted on/before {firstBiz:M/d} with Transaction_Date in {prevMonth:MMMM yyyy}), " +
+                              $"{toWrite.Count} to write" +
+                              (unparsed > 0 ? $", {unparsed} with unreadable dates kept" : "") + ".");
+            }
+            else
+            {
+                // ── Day 3+: keep up to the 1st business day, replace everything after it ──
+                replaceFrom = firstBiz.AddDays(1);
+                int unparsed = 0;
+                toWrite = rows.Where(r =>
+                {
+                    if (!TryParseTransDate(Get(r, postIdx), out var pd)) { unparsed++; return false; }
+                    return pd.Date >= replaceFrom;
+                }).ToList();
+                Console.WriteLine($"Business day {bizDay}: keeping Trans rows up to {firstBiz:M/d/yyyy}, " +
+                                  $"replacing from {replaceFrom:M/d/yyyy}. {toWrite.Count} of {rows.Count} file rows to append" +
+                                  (unparsed > 0 ? $", {unparsed} skipped (unreadable Post_Date)" : "") + ".");
             }
 
-            //StripOdbcConnection(reportPath);
+            if (toWrite.Count == 0)
+            {
+                Console.WriteLine("No rows to write — Trans tab left as is.");
+                return;
+            }
+
             Console.WriteLine(DescribeLock(reportPath) ?? "File is free.");
             WaitForFileFree(reportPath);
             // ── 7. Write to Trans tab ─────────────────────────────────────
-            WriteToTransTab(filtered, headers, dateIdx, reportPath, sheetName, numCols);
+            WriteToTransTab(toWrite, headers, reportPath, sheetName, replaceFrom);
             Console.WriteLine("Done.");
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"ERROR: {ex.Message}");
+            Console.WriteLine($"ERROR: {ex}");
+            throw;
         }
         finally
         {
@@ -1836,7 +2281,15 @@ internal static class Program
                 File.Delete(localCsv);
         }
     }
-
+    // how many business days from the 1st up to and including 'date'
+    private static int BusinessDaysSoFar(DateTime date, HashSet<DateTime> holidays)
+    {
+        int n = 0;
+        for (var d = new DateTime(date.Year, date.Month, 1); d <= date.Date; d = d.AddDays(1))
+            if (d.DayOfWeek != DayOfWeek.Saturday && d.DayOfWeek != DayOfWeek.Sunday && !holidays.Contains(d))
+                n++;
+        return n;
+    }
     private static string FindRevReport(string folder, DateTime forDate, string mustContain = null)
     {
         var month = forDate.ToString("MMMM", CultureInfo.InvariantCulture).ToUpperInvariant(); // OCTOBER
@@ -2649,337 +3102,211 @@ internal static class Program
             $"'{dateColName}' not found and CSV has fewer than {dateColIndex + 1} columns.");
     }
 
-    private static List<string[]> FilterByMonth(
-        List<string[]> rows, int dateIdx, int year, int month)
+    private static readonly string[] TransDateFormats =
+{
+    "yyyy-MM-dd", "yyyy-MM-dd HH:mm:ss", "yyyy-MM-ddTHH:mm:ss",
+    "M/d/yyyy", "M/d/yyyy H:mm", "M/d/yyyy h:mm:ss tt", "MM/dd/yyyy", "yyyyMMdd"
+};
+
+    private static bool TryParseTransDate(string s, out DateTime d) =>
+        DateTime.TryParseExact((s ?? "").Trim(), TransDateFormats, CultureInfo.InvariantCulture,
+                               DateTimeStyles.AllowWhiteSpaces, out d);
+
+    private static List<string[]> FilterByMonth(List<string[]> rows, int dateIdx, string dateColName, int year, int month)
     {
         var kept = new List<string[]>();
         int unparsed = 0;
 
+        Console.WriteLine($"  Filtering on '{dateColName}' (column {dateIdx}). Samples: " +
+            string.Join(" | ", rows.Take(5).Select(r => dateIdx < r.Length ? r[dateIdx] : "(missing)")));
+
+        var perMonth = new Dictionary<string, int>();
         foreach (var row in rows)
         {
-            if (dateIdx >= row.Length
-                || !DateTime.TryParse(row[dateIdx], CultureInfo.InvariantCulture,
-                                      DateTimeStyles.None, out var dt))
-            {
-                unparsed++;
-                continue;
-            }
-            if (dt.Year == year && dt.Month == month)
-                kept.Add(row);
+            if (dateIdx >= row.Length || !TryParseTransDate(row[dateIdx], out var dt)) { unparsed++; continue; }
+            var key = dt.ToString("yyyy-MM");
+            perMonth[key] = perMonth.TryGetValue(key, out var n) ? n + 1 : 1;
+            if (dt.Year == year && dt.Month == month) kept.Add(row);
         }
 
-        var removed = rows.Count - kept.Count;
-        Console.WriteLine(
-            $"Filtered: {rows.Count} rows -> {kept.Count} rows " +
-            $"({removed} removed, {unparsed} unparseable dates)");
+        Console.WriteLine("  Rows per month: " +
+            string.Join(", ", perMonth.OrderByDescending(kv => kv.Key).Take(4).Select(kv => $"{kv.Key}={kv.Value}")));
+        Console.WriteLine($"Filtered: {rows.Count} → {kept.Count} rows ({unparsed} unparseable dates)");
 
-        if (kept.Count == 0)
-            Console.WriteLine(
-                "WARNING: Zero rows remain after filtering. " +
-                "Check if Transaction_Date is parsed correctly.");
-
+        if (unparsed > 0)
+            Console.WriteLine("WARNING: some dates didn't match any known format — check the samples above.");
         return kept;
     }
 
-    private static void WriteToTransTab(
-    List<string[]> rows, string[] headers, int dateIdx,
-    string reportPath, string sheetName, int numCols)
+    private static void WriteToTransTab(List<string[]> rows, string[] headers,
+                                    string reportPath, string sheetName, DateTime replaceFrom)
     {
-        if (!File.Exists(reportPath))
-            throw new FileNotFoundException($"Report file not found: {reportPath}");
+        var dateCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Post_Date", "Transaction_Date", "Setup_Date" };
+        var textCols = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Zip" };   // keep leading zeros / letters
+        const string FormulaColName = "Actual Primary Agent";
 
-        using var doc = SpreadsheetDocument.Open(reportPath, true);
-        var workbookPart = doc.WorkbookPart!;
-
-        var sheet = workbookPart.Workbook.Descendants<Sheet>()
-            .FirstOrDefault(s => string.Equals(s.Name, sheetName, StringComparison.OrdinalIgnoreCase))
-            ?? throw new InvalidOperationException($"Sheet '{sheetName}' not found.");
-
-        var wsPart = (WorksheetPart)workbookPart.GetPartById(sheet.Id!);
-        var sheetData = wsPart.Worksheet.GetFirstChild<SheetData>()!;
-
-        // ══════════════════════════════════════════════════════
-        // STEP 1: Nuke everything problematic
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 1: Cleaning workbook...");
-
-        // Remove ALL queryTable parts from ALL worksheets
-        foreach (var part in workbookPart.WorksheetParts)
+        bool TryCellDate(object v, out DateTime d)
         {
-            foreach (var qtp in part.QueryTableParts.ToList())
-                part.DeletePart(qtp);
-            foreach (var el in part.Worksheet.Elements()
-                .Where(e => e.LocalName == "queryTableParts").ToList())
-                el.Remove();
-            part.Worksheet.Save();
+            if (v is double od) { d = DateTime.FromOADate(od); return true; }
+            return TryParseTransDate(Convert.ToString(v), out d);
+        }
+        object[,] To2D(object v)
+        {
+            if (v is object[,] a) return a;
+            var one = (object[,])Array.CreateInstance(typeof(object), new[] { 1, 1 }, new[] { 1, 1 });
+            one[1, 1] = v;
+            return one;
         }
 
-        // Remove ALL connections
-        foreach (var conn in workbookPart.Workbook.Descendants<Connection>().ToList())
-            conn.Remove();
-
-        // Delete calcChain
-        if (workbookPart.CalculationChainPart != null)
-            workbookPart.DeletePart(workbookPart.CalculationChainPart);
-
-        // Remove ALL table definitions from this worksheet
-        // Save the header info first
-        var oldTablePart = wsPart.TableDefinitionParts.FirstOrDefault();
-        int tableFirstCol = 1;
-        int tableLastCol = 1;
-        var tableColumnNames = new List<string>();
-
-        if (oldTablePart?.Table != null)
+        Excel.Application xl = null;
+        Excel.Workbook wb = null;
+        int excelPid = 0;
+        try
         {
-            // Parse existing table range to get column positions
-            var refStr = oldTablePart.Table.Reference?.Value ?? "A1";
-            // Read header names from the table definition
-            if (oldTablePart.Table.TableColumns != null)
+            xl = new Excel.Application
             {
-                foreach (var tc in oldTablePart.Table.TableColumns.Elements<TableColumn>())
-                    tableColumnNames.Add(tc.Name ?? "");
+                Visible = false,
+                DisplayAlerts = false,
+                AskToUpdateLinks = false,
+                ScreenUpdating = false,
+                EnableEvents = false
+            };
+            excelPid = GetExcelPid(xl);
+            wb = ComRetry(() => xl.Workbooks.Open(reportPath, UpdateLinks: 0, ReadOnly: false));
+            WaitForExcelIdle(xl);
+            if (wb.ReadOnly)
+                throw new InvalidOperationException($"{Path.GetFileName(reportPath)} opened READ-ONLY — someone has it open.");
+            xl.Calculation = Excel.XlCalculation.xlCalculationManual;
+
+            Excel.Worksheet ws = null;
+            foreach (Excel.Worksheet w in wb.Worksheets)
+                if (w.Name.Trim().Equals(sheetName, StringComparison.OrdinalIgnoreCase)) { ws = w; break; }
+            if (ws == null) throw new InvalidOperationException($"Sheet '{sheetName}' not found.");
+            if (ws.ListObjects.Count == 0)
+                throw new InvalidOperationException($"No table on '{sheetName}' — nothing written. Recreate the table once by hand.");
+
+            var lo = ws.ListObjects[1];
+            int headerRow = lo.HeaderRowRange.Row;
+            int firstCol = lo.HeaderRowRange.Column;
+            int nCols = lo.ListColumns.Count;
+            int existing = lo.DataBodyRange == null ? 0 : lo.ListRows.Count;
+            Console.WriteLine($"  Table '{lo.Name}': header row {headerRow}, {nCols} columns, {existing} rows");
+
+            // ── map CSV columns to table columns by header name ──
+            var colNames = new string[nCols];
+            for (int c = 1; c <= nCols; c++) colNames[c - 1] = lo.ListColumns[c].Name.Trim();
+            int Idx(string name) => Array.FindIndex(colNames, n => n.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+            var csvToTbl = new Dictionary<int, int>();
+            var unmapped = new List<string>();
+            for (int i = 0; i < headers.Length; i++)
+            {
+                int t = Idx(headers[i].Trim());
+                if (t >= 0 && !colNames[t].Equals(FormulaColName, StringComparison.OrdinalIgnoreCase)) csvToTbl[i] = t;
+                else if (t < 0) unmapped.Add(headers[i]);
             }
-        }
+            Console.WriteLine($"  Mapped {csvToTbl.Count} CSV columns" + (unmapped.Count > 0 ? $"; not in table: {string.Join(", ", unmapped)}" : ""));
 
-        // Read headers from actual worksheet row 1
-        var headerRow = sheetData.Elements<Row>()
-            .FirstOrDefault(r => r.RowIndex?.Value == 1);
-        if (headerRow == null)
-            throw new InvalidOperationException("Header row not found.");
+            int postCol = Idx("Post_Date");
+            if (postCol < 0) throw new InvalidOperationException("Table has no Post_Date column.");
 
-        var wsHeaders = new Dictionary<int, string>();
-        foreach (var cell in headerRow.Elements<Cell>())
-        {
-            var colIdx = GetColIndex(cell.CellReference!);
-            var val = GetCellStringValue(cell, workbookPart);
-            if (!string.IsNullOrEmpty(val))
-                wsHeaders[colIdx] = val.Trim();
-        }
-
-        int minCol = wsHeaders.Keys.Min();
-        int maxCol = wsHeaders.Keys.Max();
-
-        // Delete all table definition parts
-        foreach (var tp in wsPart.TableDefinitionParts.ToList())
-            wsPart.DeletePart(tp);
-
-        // Remove tableParts element from worksheet XML
-        foreach (var el in wsPart.Worksheet.Elements()
-            .Where(e => e.LocalName == "tableParts").ToList())
-            el.Remove();
-
-        workbookPart.Workbook.Save();
-        Console.WriteLine("  Cleaned: queryTables, connections, calcChain, table definition.");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 2: Map CSV columns to worksheet columns
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 2: Mapping columns...");
-
-        var csvToWsCol = new Dictionary<int, int>();
-        for (int csvCol = 0; csvCol < headers.Length && csvCol < numCols; csvCol++)
-        {
-            var csvHeader = headers[csvCol].Trim();
-            var match = wsHeaders.FirstOrDefault(kv =>
-                string.Equals(kv.Value, csvHeader, StringComparison.OrdinalIgnoreCase));
-            if (match.Value != null)
-                csvToWsCol[csvCol] = match.Key;
-        }
-        Console.WriteLine($"  Mapped {csvToWsCol.Count} CSV columns.");
-
-        // Find "Actual Primary Agent" column
-        int formulaColIdx = wsHeaders
-            .FirstOrDefault(kv => kv.Value.Equals("Actual Primary Agent", StringComparison.OrdinalIgnoreCase)).Key;
-
-        // ══════════════════════════════════════════════════════
-        // STEP 3: Delete from the first-business-day row onward
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 3: Locating cutoff row...");
-
-        // Resolve the Post_Date column index in the worksheet.
-        int postDateCol = wsHeaders
-            .FirstOrDefault(kv => kv.Value.Equals("Post_Date", StringComparison.OrdinalIgnoreCase)).Key;
-        if (postDateCol == 0)
-            throw new InvalidOperationException("Post_Date column not found in worksheet header.");
-
-        // First business day of the target month (weekend-only; add holidays if you have a source).
-        var firstBiz = new DateTime(DateTime.Now.Year, DateTime.Now.Month, 1);
-        while (firstBiz.DayOfWeek == DayOfWeek.Saturday || firstBiz.DayOfWeek == DayOfWeek.Sunday)
-            firstBiz = firstBiz.AddDays(1);
-        Console.WriteLine($"  First business day: {firstBiz:M/d/yyyy}");
-
-        // Walk data rows; find the LAST row whose Post_Date == firstBiz.
-        // Assumes the sheet is sorted ascending by Post_Date.
-        uint? cutoffRowIndex = null;
-        foreach (var row in sheetData.Elements<Row>().Where(r => r.RowIndex?.Value > 1))
-        {
-            var cell = row.Elements<Cell>()
-                .FirstOrDefault(c => GetColIndex(c.CellReference!) == postDateCol);
-            if (cell == null) continue;
-
-            var raw = GetCellStringValue(cell, workbookPart);
-            DateTime pd;
-            // Values may be serial numbers (DATEVALUE/number cells) or text.
-            if (double.TryParse(raw, NumberStyles.Any, CultureInfo.InvariantCulture, out var serial))
-                pd = DateTime.FromOADate(serial);
-            else if (!DateTime.TryParse(raw, CultureInfo.InvariantCulture, DateTimeStyles.None, out pd))
-                continue;
-
-            if (pd.Date == firstBiz.Date)
-                cutoffRowIndex = row.RowIndex!.Value;  // keep updating → ends on the LAST match
-        }
-
-        if (cutoffRowIndex is null)
-        {
-            // Fallback: no row matched the first business day. Decide deliberately.
-            Console.WriteLine("  WARNING: no row with Post_Date = first business day. Keeping all existing rows and appending.");
-        }
-        else
-        {
-            Console.WriteLine($"  Cutoff at row {cutoffRowIndex}. Removing that row and everything after.");
-            foreach (var row in sheetData.Elements<Row>()
-                .Where(r => r.RowIndex?.Value >= cutoffRowIndex).ToList())
-                row.Remove();
-        }
-
-        // ══════════════════════════════════════════════════════
-        // STEP 4: Write new data
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 4: Writing data...");
-        var dataToWrite = rows.Skip(1).ToList();
-        var dateColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "Post_Date", "Transaction_Date", "Setup_Date"
-        };
-
-        // Start appending after the highest surviving row index (or row 2 if only the header remains).
-        uint startRow = sheetData.Elements<Row>()
-            .Select(r => r.RowIndex?.Value ?? 1)
-            .DefaultIfEmpty(1u)
-            .Max() + 1;
-        if (startRow < 2) startRow = 2;
-
-        for (int r = 0; r < dataToWrite.Count; r++)
-        {
-            var src = dataToWrite[r];
-            var rowNum = (uint)(startRow + (uint)r);
-            var dataRow = new Row { RowIndex = rowNum };
-
-            // Collect cells with their worksheet column index, so we can sort before appending.
-            var rowCells = new List<(int col, Cell cell)>();
-
-            // Write mapped CSV values
-            foreach (var kvp in csvToWsCol)
+            // ── remove old rows (table itself stays) ──
+            if (existing > 0)
             {
-                var csvCol = kvp.Key;
-                var wsCol = kvp.Value;
-                if (csvCol >= src.Length) continue;
-                var val = src[csvCol];
-                var cell = new Cell { CellReference = GetCellRef(wsCol, (int)rowNum) };
-                var colName = wsHeaders.ContainsKey(wsCol) ? wsHeaders[wsCol] : "";
-                if (dateColumns.Contains(colName)
-                && DateTime.TryParse(val, CultureInfo.InvariantCulture,
-                         DateTimeStyles.None, out var dt))
+                if (replaceFrom == DateTime.MinValue)
                 {
-                    var dateStr = dt.ToString("M/d/yyyy");
-                    cell.CellFormula = new CellFormula($"DATEVALUE(\"{dateStr}\")");
-                    cell.DataType = null;
-                    cell.CellValue = null;
-                    cell.StyleIndex = GetOrCreateDateStyle(workbookPart);
-                }
-                else if (decimal.TryParse(val, CultureInfo.InvariantCulture, out var num))
-                {
-                    cell.DataType = CellValues.Number;
-                    cell.CellValue = new CellValue(num.ToString(CultureInfo.InvariantCulture)); // normalized (fix #2)
+                    Console.WriteLine($"  Clearing all {existing} rows — table kept.");
+                    lo.DataBodyRange.Delete(Excel.XlDeleteShiftDirection.xlShiftUp);
+                    existing = 0;
                 }
                 else
                 {
-                    cell.DataType = CellValues.String;
-                    cell.CellValue = new CellValue(val ?? string.Empty);
+                    // sort the table by Post_Date (oldest first) so day 1 is on top and the cut is clean
+                    var sort = lo.Sort;
+                    sort.SortFields.Clear();
+                    sort.SortFields.Add(lo.ListColumns[postCol + 1].DataBodyRange,
+                                        Excel.XlSortOn.xlSortOnValues, Excel.XlSortOrder.xlAscending);
+                    sort.Header = Excel.XlYesNoGuess.xlYes;
+                    sort.Apply();
+                    sort.SortFields.Clear();
+                    Console.WriteLine("  Sorted table by Post_Date.");
+
+                    var pd = To2D(lo.ListColumns[postCol + 1].DataBodyRange.Value2);
+                    int cut = -1;
+                    for (int i = 1; i <= existing; i++)
+                    {
+                        if (!TryCellDate(pd[i, 1], out var d)) continue;
+                        if (cut < 0 && d.Date >= replaceFrom) cut = i;
+                        else if (cut > 0 && d.Date < replaceFrom)
+                            throw new InvalidOperationException(
+                                $"Trans table isn't sorted by Post_Date (table row {i} is {d:M/d/yyyy}, after the cutoff at row {cut}). " +
+                                "Nothing deleted — sort the table by Post_Date and rerun.");
+                    }
+
+                    if (cut < 0)
+                        Console.WriteLine($"  No rows on/after {replaceFrom:M/d/yyyy} — keeping all {existing}, appending.");
+                    else
+                    {
+                        Console.WriteLine($"  Keeping table rows 1–{cut - 1} (up to {replaceFrom.AddDays(-1):M/d}), removing {existing - cut + 1} rows from {replaceFrom:M/d/yyyy}.");
+                        ws.Range[ws.Cells[headerRow + cut, firstCol], ws.Cells[headerRow + existing, firstCol + nCols - 1]]
+                          .Delete(Excel.XlDeleteShiftDirection.xlShiftUp);
+                        existing = cut - 1;
+                    }
                 }
-                rowCells.Add((wsCol, cell));
             }
 
-            // Add formula cell for "Actual Primary Agent"
-            if (formulaColIdx > 0)
+            // ── build the new rows ──
+            int k = rows.Count;
+            var block = new object[k, nCols];
+            for (int r = 0; r < k; r++)
             {
-                var fCell = new Cell { CellReference = GetCellRef(formulaColIdx, (int)rowNum) };
-                fCell.CellFormula = new CellFormula(
-                    $"IF({GetCellRef(wsHeaders.FirstOrDefault(kv => kv.Value.Equals("Primary Agent", StringComparison.OrdinalIgnoreCase)).Key, (int)rowNum)}=\"\"," +
-                    $"VLOOKUP({GetCellRef(wsHeaders.FirstOrDefault(kv => kv.Value.Equals("Client Group", StringComparison.OrdinalIgnoreCase)).Key, (int)rowNum)},Salesman!$H$1:$I$19,2,FALSE)," +
-                    $"{GetCellRef(wsHeaders.FirstOrDefault(kv => kv.Value.Equals("Primary Agent", StringComparison.OrdinalIgnoreCase)).Key, (int)rowNum)})");
-                rowCells.Add((formulaColIdx, fCell));
+                var src = rows[r];
+                foreach (var (csvIdx, t) in csvToTbl)
+                {
+                    if (csvIdx >= src.Length) continue;
+                    var val = src[csvIdx]?.Trim() ?? "";
+                    var name = colNames[t];
+
+                    if (val.Length == 0) block[r, t] = null;
+                    else if (dateCols.Contains(name) && TryParseTransDate(val, out var dt)) block[r, t] = dt.ToOADate();
+                    else if (!textCols.Contains(name) &&
+                             double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out var num)) block[r, t] = num;
+                    else block[r, t] = val;
+                }
             }
 
-            // Append in ascending column order — required by the OpenXML spec.
-            foreach (var (_, cell) in rowCells.OrderBy(c => c.col))
-                dataRow.Append(cell);
+            // ── write directly under the table, then grow the table over them ──
+            int startRow = headerRow + existing + 1;
+            int lastRow = startRow + k - 1;
+            ws.Range[ws.Cells[startRow, firstCol], ws.Cells[lastRow, firstCol + nCols - 1]].Value2 = block;
 
-            sheetData.Append(dataRow);
+            int fCol = Idx(FormulaColName), paCol = Idx("Primary Agent"), cgCol = Idx("Client Group");
+            if (fCol >= 0 && paCol >= 0 && cgCol >= 0)
+            {
+                int pa = firstCol + paCol, cg = firstCol + cgCol;
+                ws.Range[ws.Cells[startRow, firstCol + fCol], ws.Cells[lastRow, firstCol + fCol]].FormulaR1C1 =
+                    $"=IF(RC{pa}=\"\",VLOOKUP(RC{cg},Salesman!R1C8:R19C9,2,FALSE),RC{pa})";
+            }
+            else Console.WriteLine("  WARNING: Actual Primary Agent / Primary Agent / Client Group column missing — formula not written.");
+
+            lo.Resize(ws.Range[ws.Cells[headerRow, firstCol], ws.Cells[lastRow, firstCol + nCols - 1]]);
+
+            // ── recalc, refresh pivots (MTD reads this table), save ──
+            xl.Calculation = Excel.XlCalculation.xlCalculationAutomatic;
+            xl.CalculateFull();
+            WaitForExcelIdle(xl);
+            try { foreach (Excel.PivotCache pc in wb.PivotCaches()) pc.Refresh(); }
+            catch (Exception ex) { Console.WriteLine($"  Pivot refresh warning: {ex.Message}"); }
+
+            wb.Save();
+            Console.WriteLine($"  Wrote {k} rows. Table '{lo.Name}' now has {lo.ListRows.Count} rows.");
+            wb.Close(false); wb = null;
         }
-        Console.WriteLine($"  Wrote {dataToWrite.Count} rows.");
-
-        // ══════════════════════════════════════════════════════
-        // STEP 5: Recreate table from scratch
-        // ══════════════════════════════════════════════════════
-        Console.WriteLine("STEP 5: Recreating table...");
-        var newLastRow = (int)startRow + dataToWrite.Count - 1;
-        var firstColLetter = new string(GetCellRef(minCol, 1).TakeWhile(char.IsLetter).ToArray());
-        var lastColLetter = new string(GetCellRef(maxCol, 1).TakeWhile(char.IsLetter).ToArray());
-        var tableRef = $"{firstColLetter}1:{lastColLetter}{newLastRow}";
-
-        // Create new table definition part
-        var newTablePart = wsPart.AddNewPart<TableDefinitionPart>();
-        var tableId = (uint)(workbookPart.WorksheetParts
-            .SelectMany(wp => wp.TableDefinitionParts)
-            .Count() + 1);
-
-        var tableColumns = new TableColumns { Count = (uint)(maxCol - minCol + 1) };
-        for (int c = minCol; c <= maxCol; c++)
+        finally
         {
-            var colName = wsHeaders.ContainsKey(c) ? wsHeaders[c] : $"Column{c + 1}";
-            tableColumns.Append(new TableColumn
-            {
-                Id = (uint)(c - minCol + 1),
-                Name = colName
-            });
+            if (wb != null) try { wb.Close(false); } catch { }
+            ForceCloseExcel(xl, excelPid);
         }
-
-        newTablePart.Table = new Table
-        {
-            Id = tableId,
-            Name = "Table_Query_from_CCDS_ODBC_AIX",
-            DisplayName = "Table_Query_from_CCDS_ODBC_AIX",
-            Reference = tableRef,
-            TotalsRowShown = false,
-            AutoFilter = new AutoFilter { Reference = tableRef },
-            TableColumns = tableColumns,
-            TableStyleInfo = new TableStyleInfo
-            {
-                Name = "TableStyleMedium2",
-                ShowFirstColumn = false,
-                ShowLastColumn = false,
-                ShowRowStripes = true,
-                ShowColumnStripes = false
-            }
-        };
-        newTablePart.Table.Save();
-
-        // Add tableParts element to worksheet
-        var tableParts = new TableParts { Count = 1 };
-        tableParts.Append(new TablePart
-        {
-            Id = wsPart.GetIdOfPart(newTablePart)
-        });
-
-        // Insert tableParts at the end of the worksheet (before closing tag)
-        wsPart.Worksheet.Append(tableParts);
-
-        wsPart.Worksheet.Save();
-        workbookPart.Workbook.Save();
-
-        Console.WriteLine($"  Table recreated: {tableRef}");
-        Console.WriteLine($"Done. Wrote {dataToWrite.Count} rows to '{sheetName}'.");
     }
 
     private static uint GetOrCreateDateStyle(WorkbookPart workbookPart)
@@ -3372,7 +3699,7 @@ internal static class Program
         var reportPage = await reportPageTask;
 
         await reportPage.WaitForLoadStateAsync(LoadState.DOMContentLoaded);
-        await reportPage.WaitForTimeoutAsync(5000);
+        await reportPage.WaitForTimeoutAsync(8000);
 
         // ── FIND THE CRITERIA FRAME ───────────
         IFrame criteriaFrame = null;

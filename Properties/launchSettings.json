@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "DailyRevenueReportAutomation": {
+      "commandName": "Project",
+      "commandLineArgs": "--reset-month 2026-10"
+    }
+  }
+}
