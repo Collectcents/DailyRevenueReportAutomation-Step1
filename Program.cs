@@ -76,7 +76,8 @@ internal static class Program
         {
             //TD Portal automation to download the report CSV directly
             //RunStep("TD portal + Rev Report", () => RunTDPortalAutomation().GetAwaiter().GetResult());
-            RunStep("ACE transactions → Trans tab", () => RunOnSta(GetDailyRevenueACETransactions));
+            //RunStep("ACE transactions → Trans tab", () => RunOnSta(GetDailyRevenueACETransactions));
+            RunOnSta(RunCibcDrsCalculator);
 
             //bool cibcDownloaded = RunStep("CIBC portal download", () => RunCIBCPortalAutomation().GetAwaiter().GetResult());
             //if (cibcDownloaded)
@@ -2467,7 +2468,17 @@ internal static class Program
             // ══════════════════════════════════════════════
             // STEP C: Read Tim Katis G, compute D − G
             // ══════════════════════════════════════════════
-            const int timFirst = 118;                               // CONFIRM 117 vs 118
+            // find where the CIBC block starts: the row in B whose name = the calculator's first agent (row 9)
+            string Norm(string s) => Regex.Replace((s ?? "").ToUpperInvariant(), @"\s+", " ").Trim();
+            var firstName = Norm(cNames[0]);                       // e.g. JESSICA NOBREGA
+            var bScan = (object[,])tim.Range["H117:H260"].Value2;
+            int timFirst = -1;
+            for (int i = 1; i <= bScan.GetLength(0); i++)
+                if (Norm(Convert.ToString(bScan[i, 1])) == firstName) { timFirst = 116 + i; break; }
+            if (timFirst < 0)
+                throw new InvalidOperationException($"'{cNames[0]}' not found in Tim Katis B100:B260 — not pasting.");
+            Console.WriteLine($"  CIBC block starts at Tim Katis row {timFirst} ({cNames[0]})");
+
             int timLast = timFirst + n - 1;
             var gVals = (object[,])tim.Range[$"G{timFirst}:G{timLast}"].Value2;
             var tNames = (object[,])tim.Range[$"B{timFirst}:B{timLast}"].Value2;
@@ -2476,7 +2487,7 @@ internal static class Program
             for (int i = 0; i < n; i++)
             {
                 double g = gVals[i + 1, 1] is double gd ? gd : 0;
-                result[i, 0] = dNums[i] - g;
+                result[i, 0] = Math.Round(dNums[i] - g, 2);
                 Console.WriteLine($"  calc r{calcFirst + i,-3} {cNames[i],-25} | tim r{timFirst + i,-3} {Convert.ToString(tNames[i + 1, 1]),-40} | {dNums[i],12:N2} - {g,12:N2} = {dNums[i] - g,12:N2}");
             }
 
